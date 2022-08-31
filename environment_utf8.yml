@@ -1,0 +1,25 @@
+﻿name: ca_ann_reg
+channels:
+  - defaults
+dependencies:
+  - h5py>=3.6.*
+  - jupyter_console=6.4.*
+  - libtiff=4.2.*
+  - matplotlib=3.5.*
+  - numba=0.53.*
+  - numpy=1.21.*
+  - pandas=1.4.*
+  - pillow=8.4.*
+  - pip=21.2.*
+  - python=3.9.*
+  - pytables=3.6.*
+  - scikit-image=0.18.*
+  - scikit-learn=1.0.*
+  - scipy=1.7.*
+  - seaborn=0.11.*
+  - statsmodels=0.13.*
+  - pip:
+    - tensorflow==2.7.1
+    - tensorflow-gpu=2.7.1
+    - upsetplot
+    - matplotlib_venn
