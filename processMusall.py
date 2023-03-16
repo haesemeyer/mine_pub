@@ -157,9 +157,11 @@ def analyze_data(d_folder, s_folder) -> Tuple[Any, Any, Any, Any, Optional[MineD
         pred /= (np.std(pred) + 1e-16)
     r -= np.mean(r, 1, keepdims=True)
     r /= np.std(r, 1, keepdims=True)
-    # corr-cut set to 0.1 to only fully process data with at least 1% explained variance on test
-    miner = Mine(2 / 3, 150, 0.1, True, False, True, 30, 143)
-    mdata = miner.analyze_data(p, r)
+    with h5py.File(path.join(d_folder, f"{s_folder}_models.hdf5"), 'w') as model_file:
+        # corr-cut set to 0.1 to only fully process data with at least 1% explained variance on test
+        miner = Mine(2 / 3, 150, 0.1, True, True, 30, 143)
+        miner.model_weight_store = model_file
+        mdata = miner.analyze_data(p, r)
 
     return predictors, responses, predictor_labels, spatial, mdata
 
@@ -223,7 +225,8 @@ def main(data_folder: str, out_file_name: str, n_processes: int) -> None:
         if pool is not None:
             for ar in all_async_results:
                 preds, res, plabels, sptl, mine_data = ar[0].get()
-                save_data(ar[1], outfile, preds, plabels, res, sptl, mine_data)
+                if preds is not None:
+                    save_data(ar[1], outfile, preds, plabels, res, sptl, mine_data)
 
 
 if __name__ == "__main__":

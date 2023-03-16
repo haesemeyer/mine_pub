@@ -5,7 +5,7 @@ Script to plot paper figure panels from main analysis file generated via rwave_b
 import argparse
 import os
 from os import path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List
 import h5py
 import numpy as np
 import matplotlib as mpl
@@ -14,11 +14,13 @@ from matplotlib_venn import venn2
 import seaborn as sns
 from statsmodels.tsa.stattools import acf
 from pandas import DataFrame
-from scipy.stats.mstats import mquantiles
-
 import rwave_build_main as rbm
 import upsetplot as ups
 import utilities
+import model
+from sklearn.cluster import SpectralClustering
+import AnatomyClustering as acl
+from collections import Counter
 
 
 class CheckArgs(argparse.Action):
@@ -40,37 +42,6 @@ class CheckArgs(argparse.Action):
             setattr(namespace, self.dest, values)
         else:
             raise Exception("Parser was asked to check unknown argument")
-
-
-def plot_region_outlines(brain: Optional[np.ndarray], projection: int, regions_to_plot: List[str],
-                         masks: h5py.Group, region_weights: Optional[List[float]]) -> pl.figure:
-    """
-    Plots outlines of a list of named regions on an optional overall brain (or other) outline
-    :param brain: A general outline to plot in the background
-    :param projection: The projection axis (0-2)
-    :param regions_to_plot: List of regions to plot in the main plot
-    :param masks: hdf5 object that contains the outlines
-    :param region_weights: Optionally for each region a different plot weight
-    :return: The figure object
-    """
-    if projection < 0 or projection > 2:
-        raise ValueError(f"Unknown projection direction {projection}")
-    if region_weights is None:
-        region_weights = np.ones(len(regions_to_plot))
-    elif len(region_weights) != len(regions_to_plot):
-        raise ValueError("region_weights has to be none or have the same length as regions_to_plot")
-    region_outline = None
-    for rtp, w in zip(regions_to_plot, region_weights):
-        if region_outline is None:
-            region_outline = np.sum(masks[rtp][()], projection)
-        else:
-            region_outline += np.sum(masks[rtp][()], projection)
-    region_outline[region_outline > 50] = 50
-    rfig = pl.figure()
-    if brain is not None:
-        pl.imshow(brain, cmap="bone")
-    pl.imshow(region_outline, cmap="hot", alpha=0.75)
-    return rfig
 
 
 def plot_region_enrichment(c_of_interest: np.ndarray, population: np.ndarray, masks: h5py.Group,
@@ -102,7 +73,18 @@ def plot_region_enrichment(c_of_interest: np.ndarray, population: np.ndarray, ma
     sel_in_regions = np.sum(r_memship[c_of_interest], 0)
     sel_in_regions = sel_in_regions[r_valid]
     sel_frac = sel_in_regions / pop_in_regions
-    sel_sort = np.argsort(sel_frac)[::-1]
+    # create rough anterior->posterior sort index for region display
+    sort_value = np.zeros(sel_frac.size)
+    for index, rl in enumerate(r_labels):
+        if "Telencephalon" in rl:
+            sort_value[index] = 1
+        elif "Diencephalon" in rl:
+            sort_value[index] = 2
+        elif "Mesencephalon" in rl:
+            sort_value[index] = 3
+        elif "Rhombencephalon" in rl:
+            sort_value[index] = 4
+    sel_sort = np.argsort(sort_value, kind='stable')[::-1]
 
     # computed expected quantity and for each region based on the number
     # of neurons in there (pop_in_region) a confidence interval
@@ -128,22 +110,6 @@ def plot_region_enrichment(c_of_interest: np.ndarray, population: np.ndarray, ma
     sns.despine()
     figure.tight_layout()
     figure.savefig(path.join(plot_dir, f"ZBrainRegions_Fraction_{name}Neurons.{ext}"), dpi=300)
-
-    # select up to five top-enriched regions but only those for which the actual enrichment is larger
-    # than the top confidence band of the expectation
-    sel_top = []
-    sel_w = []
-    for lb, f, u in zip(sorted_labels, sorted_frac, sorted_upper):
-        if len(sel_top) >= 5:
-            break
-        if f > u:
-            sel_top.append(lb)
-            sel_w.append(f)
-
-    figure = plot_region_outlines(outline_top, 2, sel_top, masks, sel_w)
-    figure.savefig(path.join(plot_dir, f"Anatomy_Top{len(sel_w)}Ranked_{name}_Top.{ext}"), dpi=600)
-    figure = plot_region_outlines(outline_side, 1, sel_top, masks, sel_w)
-    figure.savefig(path.join(plot_dir, f"Anatomy_Top{len(sel_w)}Ranked_{name}_Side.{ext}"), dpi=600)
 
 
 def plot_autocorrelations(in_mat: np.ndarray, lags: int, name: str) -> None:
@@ -192,6 +158,101 @@ def boot_complexity(all_scores: np.ndarray, subset_size: int, ci: float, n_boot:
     return np.percentile(samples, (100 - ci) / 2), np.percentile(samples, (100 - ci) / 2 + ci), np.mean(samples)
 
 
+def get_neuron_model_weights(neuron_id: int, neuronlist: DataFrame, experimentlist: DataFrame,
+                             mfilepath: str) -> List[np.ndarray]:
+    """
+    For a given neuron returns the weights of the fit model of that neuron
+    :param neuron_id: The index of the neuron in question
+    :param neuronlist: The neuron-list dataframe
+    :param experimentlist: The experimet-list dataframe
+    :param mfilepath: Path to the directory with the model files
+    :return: Weightlist of the model
+    """
+    all_neuron_ids = np.hstack(neuronlist["neuron_id"])  # the ids of all neurons
+    all_plane_ids = np.hstack(neuronlist["plane"])  # all plane ids for each neuron across all experiments
+    all_experiment_ids = np.hstack(neuronlist["experiment_id"])  # all experiment ids for each neuron
+    this_neuron_plane = all_plane_ids[all_neuron_ids == neuron_id][0]  # imaging plane of neuron in question
+    ex_id = all_experiment_ids[all_neuron_ids == neuron_id]  # the experiment id of this neuron
+    # Count how many neurons are in total in the plane and experiment of the neuron in question
+    neuron_plane_count = np.sum(np.logical_and(all_plane_ids == this_neuron_plane, all_experiment_ids == ex_id))
+    # Get the indices of all the neurons within the same plane of the same experiment
+    neurons_in_plane = all_neuron_ids[np.logical_and(all_plane_ids == this_neuron_plane, all_experiment_ids == ex_id)]
+    # Find within the given plane and experiment what the index is of the neuron under consideration
+    this_neuron_in_plane_id = np.arange(neuron_plane_count)[neurons_in_plane == neuron_id][0]  # original cell index
+    all_experiment_ids = np.hstack(experimentlist["experiment_id"])
+    experiment_name = np.hstack(experimentlist["experiment_name"])[all_experiment_ids == ex_id][0]
+    file_name = experiment_name.decode("UTF-8") + "_fit_models.hdf5"
+    with h5py.File(path.join(mfilepath, file_name), 'r') as mfile:
+        model_save_group = f"M_plane_{this_neuron_plane}_cell_{this_neuron_in_plane_id}_trained"
+        return utilities.modelweights_from_hdf5(mfile[model_save_group])
+
+
+def get_neuron_model(neuron_id: int, neuronlist: DataFrame, experimentlist: DataFrame,
+                     mfilepath: str) -> model.ActivityPredictor:
+    """
+    For a given neuron returns the model that was fit to that neuron
+    :param neuron_id: The index of the neuron in question
+    :param neuronlist: The neuron-list dataframe
+    :param experimentlist: The experimet-list dataframe
+    :param mfilepath: Path to the directory with the model files
+    :return: The CNN model
+    """
+    m_weights = get_neuron_model_weights(neuron_id, neuronlist, experimentlist, mfilepath)
+    m = model.get_standard_model(m_weights[0].shape[0])
+    init_in = np.random.randn(1, m_weights[0].shape[0], m_weights[0].shape[1]).astype(np.float32)
+    m(init_in)
+    m.set_weights(m_weights)
+    m(init_in)
+    return m
+
+
+def get_drive_outputs(netw: model.ActivityPredictor, netw_j: np.ndarray, ix_i1: int, ix_i2: int, drive_min: float,
+                      drive_max: float, n_drives: int) -> np.ndarray:
+    """
+    Uses a network's data-mean jacobian to create 2D variatins in input drive and computes the corresponding model
+    outputs
+    :param netw: The model
+    :param netw_j: The jacobian of the model at the original data mean (receptive field)
+    :param ix_i1: The index of the first input for which drive should be varied
+    :param ix_i2: The index of the second input for which drive should be varied
+    :param drive_min: The minimal drive to use
+    :param drive_max: The maximal drive to use
+    :param n_drives: The number of discrete drive values along each axis
+    :return: n_drives x n_drives matrix of network outputs
+    """
+    hist = netw.input_length
+    drives = np.linspace(drive_min, drive_max, n_drives)
+    n_inputs = netw_j.size // hist
+    i_base = np.full((1, hist, n_inputs), np.nan)
+    for i in range(n_inputs):
+        i_base[0, :, i] = netw_j.ravel()[i*hist:(i+1)*hist]
+    i_base[:, :, ix_i1] = i_base[:, :, ix_i1]/np.linalg.norm(i_base[:, :, ix_i1])
+    i_base[:, :, ix_i2] = i_base[:, :, ix_i2]/np.linalg.norm(i_base[:, :, ix_i2])
+    m_output = np.full((n_drives, n_drives), np.nan)
+    for i, drive1 in enumerate(drives):
+        for j, drive2 in enumerate(drives):
+            i_current = i_base.copy()
+            i_current[:, :, ix_i1] = i_current[:, :, ix_i1] * drive1
+            i_current[:, :, ix_i2] = i_current[:, :, ix_i2] * drive2
+            m_output[i, j] = netw(i_current)
+    return m_output
+
+
+def plot_drive_response(drive_mat):
+    """
+    Plots the drive response as a heatmap as well as three cross-sections
+    :param drive_mat: The sensory vs. motor drive response of a neuron
+    :return: The figure object for saving
+    """
+    dfig, (ax1, ax2) = pl.subplots(ncols=2)
+    sns.heatmap(data=drive_mat, ax=ax1, cmap='inferno')
+    ax2.plot(drive_mat[:, 24], label="Motor drive = -5")
+    ax2.plot(drive_mat[:, 49], label="Motor drive = 0")
+    ax2.plot(drive_mat[:, 74], label="Motor drive = 5")
+    ax2.legend()
+    return dfig
+
+
 if __name__ == "__main__":
     mpl.rcParams['pdf.fonttype'] = 42
 
@@ -212,6 +273,8 @@ if __name__ == "__main__":
     data_folder, data_filename = path.split(data_file)
     base_name = path.splitext(data_filename)[0]
 
+    model_file_folder = path.join(data_folder, "fit_models")
+
     plot_dir = path.join(data_folder, f"{base_name}_figure_panels")
     if not path.exists(plot_dir):
         os.makedirs(plot_dir)
@@ -222,9 +285,9 @@ if __name__ == "__main__":
             print("Data in file was analyzed with different fit threshold than intended for publication")
         if not np.isclose(fit_threshold, dfile["Linear model threshold"][()]):
             print("Linear and ANN model thresholds used in analysis file are different from each other")
-        nl_threshold = dfile["Nonlinearity threshold"][()]  # should be 50% probability of being nonlinear
-        if not np.isclose(nl_threshold, 0.5):
-            print("Data in file was analyzed with different nonlinearity threshold than intended for publication")
+        lscore_th = dfile["Linear model score threshold"][()]  # should be >=80% of explained variance to be linear
+        if not np.isclose(lscore_th, 0.8):
+            print("Data in file was analyzed with different linearity threshold than intended for publication")
         me_threshold = dfile["Mean expansion R2 threshold"][()]  # me-scores are already in the form of R^2 values
         if not np.isclose(me_threshold, 0.5):
             print("Data in file was analyzed with different mean expansion threshold than intended for publication")
@@ -291,61 +354,31 @@ if __name__ == "__main__":
         fig.savefig(path.join(plot_dir, f"ANN_LM_Threshold_Comparison.{ext}"), dpi=300)
 
         # plot nonlinearity model probabilities
-        nl_prob = np.hstack(df_raw["nl_prob"])[above_thresh]
+        l_approx_score = np.hstack(df_raw["linear_model_score"])[above_thresh]
         fig = pl.figure()
-        sns.kdeplot(nl_prob)
-        pl.plot([nl_threshold, nl_threshold], [0, 1], 'k--')
-        pl.xlabel("p(Nonlinear)")
+        sns.kdeplot(l_approx_score)
+        pl.plot([lscore_th, lscore_th], [0, 1], 'k--')
+        pl.xlabel("Linear approximation [R2]")
         pl.ylabel("Density")
         sns.despine(fig)
-        fig.savefig(path.join(plot_dir, f"Nonlin_LRM_Prb_Distribution.{ext}"), dpi=300)
-
-        # plot relationship of our nonlinearity metrics
-        all_curve_metrics = np.hstack(df_raw["curvature"])[above_thresh]
-        all_nlc_metrics = np.hstack(df_raw["nlc"])[above_thresh]
-        crv_test_bins = mquantiles(all_curve_metrics, np.linspace(0, 1, 50))
-        crv_test_bin_cents = crv_test_bins[:-1] + np.diff(crv_test_bins) / 2
-        boot_sample = utilities.bootstrap_binned_average(all_curve_metrics, all_nlc_metrics, crv_test_bins, 5000)
-        average = np.nanmean(boot_sample, 0)
-        ci_low = np.percentile(boot_sample, 2.5, 0)
-        ci_high = np.percentile(boot_sample, 97.5, 0)
-        fig = pl.figure()
-        pl.plot(crv_test_bin_cents, average, 'o')
-        pl.fill_between(crv_test_bin_cents, ci_low, ci_high, alpha=0.4)
-        pl.xlabel("Curvature")
-        pl.ylabel("Average NLC")
-        sns.despine()
-        fig.savefig(path.join(plot_dir, f"Avg_NLC_by_curvature.{ext}"), dpi=300)
-        nlc_test_bins = mquantiles(all_nlc_metrics, np.linspace(0, 1, 50))
-        nlc_test_bin_cents = nlc_test_bins[:-1] + np.diff(nlc_test_bins) / 2
-        boot_sample = utilities.bootstrap_binned_average(all_nlc_metrics, all_curve_metrics, nlc_test_bins, 5000)
-        average = np.nanmean(boot_sample, 0)
-        ci_low = np.percentile(boot_sample, 2.5, 0)
-        ci_high = np.percentile(boot_sample, 97.5, 0)
-        fig = pl.figure()
-        pl.plot(nlc_test_bin_cents, average, 'o')
-        pl.fill_between(nlc_test_bin_cents, ci_low, ci_high, alpha=0.4)
-        pl.xlabel("NLC")
-        pl.ylabel("Average Curvature")
-        sns.despine()
-        fig.savefig(path.join(plot_dir, f"Avg_curvature_by_NLC.{ext}"), dpi=300)
+        fig.savefig(path.join(plot_dir, f"Linear_approximation_score_Distribution.{ext}"), dpi=300)
 
         # plot relationship of nonlinearity probability and me-score
         me_score = np.hstack(df_raw["me_score"])[above_thresh]
         fig = pl.figure()
-        pl.scatter(nl_prob, me_score, s=2, alpha=0.25, c='C3')
+        pl.scatter(l_approx_score, me_score, s=2, alpha=0.25, c='C3')
         pl.plot([0, 1], [me_threshold, me_threshold], 'k--')
-        pl.plot([nl_threshold, nl_threshold], [0, 1], 'k--')
-        pl.text(0.25, 0.75, np.sum(np.logical_and(nl_prob < nl_threshold, me_score >= me_threshold)))
-        pl.text(0.25, 0.25, np.sum(np.logical_and(nl_prob < nl_threshold, me_score < me_threshold)))
-        pl.text(0.75, 0.75, np.sum(np.logical_and(nl_prob >= nl_threshold, me_score >= me_threshold)))
-        pl.text(0.75, 0.25, np.sum(np.logical_and(nl_prob >= nl_threshold, me_score < me_threshold)))
+        pl.plot([lscore_th, lscore_th], [0, 1], 'k--')
+        pl.text(0.25, 0.75, np.sum(np.logical_and(l_approx_score < lscore_th, me_score >= me_threshold)))
+        pl.text(0.25, 0.25, np.sum(np.logical_and(l_approx_score < lscore_th, me_score < me_threshold)))
+        pl.text(0.75, 0.75, np.sum(np.logical_and(l_approx_score >= lscore_th, me_score >= me_threshold)))
+        pl.text(0.75, 0.25, np.sum(np.logical_and(l_approx_score >= lscore_th, me_score < me_threshold)))
         pl.xlim(-0.01, 1.01)
         pl.ylim(-0.01, 1.01)
-        pl.xlabel("Nonlinearity probability")
+        pl.xlabel("Linear approximation $R^2$")
         pl.ylabel("2nd order model $R^2$")
         sns.despine()
-        fig.savefig(path.join(plot_dir, f"mescore_vs_nlprob.{ext}"), dpi=300)
+        fig.savefig(path.join(plot_dir, f"mescore_vs_linscore.{ext}"), dpi=300)
 
         #######################################
         # Paradigm analysis
@@ -497,6 +530,29 @@ if __name__ == "__main__":
         axes_dict['intersections'].set_yscale('log')
         fig.savefig(path.join(plot_dir, f"BarcodeUpsetPlot.{ext}"), dpi=300)
 
+        # for fish-contribution analysis convert barcode into unique cluster numbers
+        bc_cluster_number = np.zeros(barcodes.shape[0])
+        for i in range(6):
+            bc_cluster_number += barcodes[:, i] * (2**i)
+        # as in plot limit clusters by minimum size of 10, put all else into a "-1" cluster
+        cnt = Counter(bc_cluster_number)
+        # find the experiment id that belongs to each clustered neuron
+        df_neuron_list = rbm.get_neuron_list(dfile)
+        exp_fit = np.hstack(df_neuron_list["experiment_id"])[np.hstack(df_neuron_list["is_ann_fit"])]
+        # neuron_fit_id = np.hstack(df_fit["neuron_id"])
+        # print how many experiments contributed to each cluster sorted by cluster size (same order as in upset plot)
+        # for all clusters with at least 10 neurons (same cutoff as in plot)
+        unique_clusters = np.array([k for k in cnt])
+        cluster_sizes = np.array([cnt[k] for k in cnt])
+        size_sort = np.argsort(cluster_sizes)[::-1]
+        cluster_sizes = cluster_sizes[size_sort]
+        unique_clusters = unique_clusters[size_sort]
+        for i, cnum in enumerate(unique_clusters):
+            if cluster_sizes[i] < 10:
+                break
+            clus_exps = exp_fit[bc_cluster_number == cnum]
+            print(f"Cluster {i} has {np.unique(clus_exps).size} contributing fish")
+
         nl_id = barcode_labels.index("Nonlin")
         t_id = barcode_labels.index("Temperature")
         ang_id = barcode_labels.index("sum_tail")
@@ -508,6 +564,7 @@ if __name__ == "__main__":
         any_interact = slice([loc for loc, s in enumerate(barcode_labels) if "I" in s][0], barcodes.shape[1])
 
         non_linear = barcodes[:, nl_id] == 1
+        complex_2 = np.hstack(df_fit["complexity"]) == 2
         linear = np.logical_not(non_linear)
         sens_contrib = barcodes[:, t_id] == 1
         mot_contrib = np.sum(barcodes[:, any_b_id] == 1, 1) >= 1
@@ -530,18 +587,27 @@ if __name__ == "__main__":
                                             int_contrib)
         interact_cluster = np.logical_or(interact_lin_cluster, interact_nl_cluster)
 
-        # plot distribution of nonlinearity metrics for the different types
-        fig = pl.figure()
-        sns.kdeplot(nl_prob[interact_cluster], label="Mixed", cut=0)
-        sns.kdeplot(nl_prob[sensory_cluster], label="Stimulus", cut=0)
-        sns.kdeplot(nl_prob[motor_cluster], label="Behavior", cut=0)
-        pl.plot([nl_threshold, nl_threshold], [0, 1], 'k--')
-        pl.xlabel("p(Nonlinear)")
-        pl.ylabel("Density")
-        sns.despine(fig)
-        pl.legend()
-        fig.savefig(path.join(plot_dir, f"Nonlin_LRM_Prb_Distribution_By_Type.{ext}"), dpi=300)
+        df_experiment_list = rbm.get_experiment_list(dfile)
 
+        all_jacs = np.vstack(df_fit['jacobian'])
+        all_fit_neuron_ids = np.hstack(df_fit["neuron_id"])
+
+        # Plot anatomical clustering of our types of interest
+        all_centroids_um = np.vstack(df_neuron_list["zbrain_coords"])
+        all_centroids_um = all_centroids_um[above_thresh]
+        # By response type
+        lcoors_sensory = acl.Cluster_Neurons(all_centroids_um[sensory_cluster], [5])[-1]
+        lcoors_motor = acl.Cluster_Neurons(all_centroids_um[motor_cluster], [5])[-1]
+        lcoors_interact = acl.Cluster_Neurons(all_centroids_um[interact_cluster], [5])[-1]
+        # Neurons by complexity
+        complexity = np.hstack(df_fit["complexity"])
+        c0 = complexity == 0  # linear
+        c1 = complexity == 1  # nonlinear and 2nd order model can fit response
+        c2 = complexity == 2  # nonlinear and 2nd order model cannot fit response
+        lcoors_comp0 = acl.Cluster_Neurons(all_centroids_um[c0], [5])[-1]
+        lcoors_comp1 = acl.Cluster_Neurons(all_centroids_um[c1], [5])[-1]
+        lcoors_comp2 = acl.Cluster_Neurons(all_centroids_um[c2], [5])[-1]
+        # Motor types
         # create motor-type clusters and make them exclusive - otherwise in the region enrichments
         # below some regions can be enriched for all types, since the expectations underestimate
         ang_cluster = barcodes[:, ang_id] == 1
@@ -549,10 +615,82 @@ if __name__ == "__main__":
         start_cluster = barcodes[:, start_id] == 1
         start_cluster[np.logical_or(ang_cluster, disp_cluster)] = False
         ang_cluster[disp_cluster] = False
+        lcoors_start = acl.Cluster_Neurons(all_centroids_um[start_cluster], [5])[-1]
+        lcoors_disp = acl.Cluster_Neurons(all_centroids_um[disp_cluster], [5])[-1]
+        lcoors_ang = acl.Cluster_Neurons(all_centroids_um[ang_cluster], [5])[-1]
+
+        bg_centroids = all_centroids_um[np.random.rand(all_centroids_um.shape[0]) < 0.1, :]
+
+        acl.plot_anatomy(lcoors_sensory[5], bg_centroids, "Sensory", plot_dir, "C1")
+        acl.plot_anatomy(lcoors_motor[5], bg_centroids, "Motor", plot_dir, "C2")
+        acl.plot_anatomy(lcoors_interact[5], bg_centroids, "Mixed", plot_dir, "C0")
+
+        acl.plot_anatomy(lcoors_comp0[5], bg_centroids, "Comp0", plot_dir, "C0")
+        acl.plot_anatomy(lcoors_comp1[5], bg_centroids, "Comp1", plot_dir, "C0")
+        acl.plot_anatomy(lcoors_comp2[5], bg_centroids, "Comp2", plot_dir, "C0")
+
+        acl.plot_anatomy(lcoors_start[5], bg_centroids, "Start", plot_dir, "C0")
+        acl.plot_anatomy(lcoors_disp[5], bg_centroids, "Disp", plot_dir, "C0")
+        acl.plot_anatomy(lcoors_ang[5], bg_centroids, "Dir", plot_dir, "C0")
+
+        # Plot response of neurons that are mixed for bout-start, nonlinear and sensory
+        # w.r.t. input drive along sensory and bout start kernels - use clustering to group responses
+        # Note: The clustering below is somewhat loose - we use cross-correlations to cluster since we do not
+        # expect to have the exact same locations but rather want to cluster on shape of the response landscape
+        # However, that term isn't as well defined as we would like
+        mixed_bs_sens_nl_clust = np.logical_and(np.logical_and(sens_contrib, non_linear), barcodes[:, start_id] == 1)
+        mixed_neuron_ids = np.hstack(df_fit["neuron_id"][mixed_bs_sens_nl_clust])
+
+        # find all drive responses - note this is timetaking
+        all_drive_responses = []
+        all_dr_fft = []
+        similarity_matrix = np.zeros((mixed_neuron_ids.size, mixed_neuron_ids.size))
+        for i, ntt in enumerate(mixed_neuron_ids):
+            neuron_model = get_neuron_model(ntt, df_neuron_list, df_experiment_list, model_file_folder)
+            do = get_drive_outputs(neuron_model, all_jacs[all_fit_neuron_ids == ntt], 0, 1, -10, 10, 100)
+            all_drive_responses.append(do)
+            print(f"Drive output {i+1} out of {mixed_neuron_ids.size} completed")
+
+        # compute and store fourier transforms to speed up crosscorrelations
+        for i, dr in enumerate(all_drive_responses):
+            norm = np.linalg.norm(dr)
+            all_dr_fft.append(np.fft.fft2(dr) / norm)
+            print(f"Fourier transform {i + 1} out of {mixed_neuron_ids.size} completed")
+
+        # use cross-correlations to compute similarities so that we tolerate shifts
+        for i in range(mixed_neuron_ids.size):
+            for j in range(i, mixed_neuron_ids.size):
+                # note: the ordering of elements will be different than if calling scipy.signal.correlate2d
+                cross_corr = np.absolute(np.fft.ifft2(all_dr_fft[i] * all_dr_fft[j].conjugate()))
+                similarity = np.max(cross_corr)
+                similarity_matrix[i, j] = similarity
+                similarity_matrix[j, i] = similarity
+                print(f"Cross correlation {i*mixed_neuron_ids.size + j + 1} out of {mixed_neuron_ids.size**2} completed")
+
+        # use spectral clustering to group neurons
+        spc = SpectralClustering(n_clusters=10, affinity="precomputed")
+        spc.fit(similarity_matrix)
+        cid = spc.labels_.copy()
+
+        # plot the first member of each cluster as an exemplar
+        for i in range(10):
+            to_plot = np.where(cid == i)[0][0]
+            fig = plot_drive_response(all_drive_responses[to_plot])
+            fig.savefig(path.join(plot_dir, f"Motor_drive_exemplar_C{i}_0.{ext}"), dpi=300)
+
+        # plot distribution of linear model scores for the different types
+        fig = pl.figure()
+        sns.kdeplot(l_approx_score[interact_cluster], label="Mixed", cut=0)
+        sns.kdeplot(l_approx_score[sensory_cluster], label="Stimulus", cut=0)
+        sns.kdeplot(l_approx_score[motor_cluster], label="Behavior", cut=0)
+        pl.plot([lscore_th, lscore_th], [0, 1], 'k--')
+        pl.xlabel("Linear model approximation $R^2$")
+        pl.ylabel("Density")
+        sns.despine(fig)
+        pl.legend()
+        fig.savefig(path.join(plot_dir, f"LinModelApprox_Distribution_By_Type.{ext}"), dpi=300)
 
         # for different clusters compute the fraction of units also identified by the linear model
-        df_neuron_list = rbm.get_neuron_list(dfile)
-        exp_fit = np.hstack(df_neuron_list["experiment_id"])[np.hstack(df_neuron_list["is_ann_fit"])]
         fit_lm_fit = np.hstack(df_fit["is_lm_fit"])
         expts = np.unique(exp_fit)
         d_lm = {"Type": [], "LM ID fraction": []}
@@ -564,12 +702,16 @@ if __name__ == "__main__":
             this_sens = sensory_cluster[this_exp]
             this_mot = motor_cluster[this_exp]
             this_int = interact_cluster[this_exp]
+            this_complex_2 = complex_2[this_exp]
 
             d_lm["Type"].append("All")
             d_lm["LM ID fraction"].append(np.sum(lm_abt) / lm_abt.size)
 
             d_lm["Type"].append("Nonlinear")
             d_lm["LM ID fraction"].append(np.sum(lm_abt[this_nonlinear]) / np.sum(this_nonlinear))
+
+            d_lm["Type"].append("Complexity 2")
+            d_lm["LM ID fraction"].append(np.sum(lm_abt[this_complex_2]) / np.sum(this_complex_2))
 
             d_lm["Type"].append("Sensory")
             d_lm["LM ID fraction"].append(np.sum(lm_abt[this_sens]) / np.sum(this_sens))
@@ -579,6 +721,7 @@ if __name__ == "__main__":
 
             d_lm["Type"].append("Interaction")
             d_lm["LM ID fraction"].append(np.sum(lm_abt[this_int]) / np.sum(this_int))
+
         df_lm = DataFrame(d_lm)
 
         fig = pl.figure()
@@ -588,27 +731,27 @@ if __name__ == "__main__":
 
         # plot relationship of nonlinearity probability and me-score just for sensory units
         mes_sens = me_score[sensory_cluster]
-        nlp_sens = nl_prob[sensory_cluster]
-        q1 = np.logical_and(nlp_sens < nl_threshold, mes_sens >= me_threshold)
-        q2 = np.logical_and(nlp_sens < nl_threshold, mes_sens < me_threshold)
-        q3 = np.logical_and(nlp_sens >= nl_threshold, mes_sens >= me_threshold)
-        q4 = np.logical_and(nlp_sens >= nl_threshold, mes_sens < me_threshold)
+        lap_sens = l_approx_score[sensory_cluster]
+        q1 = np.logical_and(lap_sens < lscore_th, mes_sens >= me_threshold)
+        q2 = np.logical_and(lap_sens < lscore_th, mes_sens < me_threshold)
+        q3 = np.logical_and(lap_sens >= lscore_th, mes_sens >= me_threshold)
+        q4 = np.logical_and(lap_sens >= lscore_th, mes_sens < me_threshold)
         fig = pl.figure()
-        pl.scatter(nlp_sens[np.logical_or(q1, q2)], mes_sens[np.logical_or(q1, q2)], s=2, alpha=0.25, c='k')
-        pl.scatter(nlp_sens[q3], mes_sens[q3], s=2, alpha=0.25, c='C0')
-        pl.scatter(nlp_sens[q4], mes_sens[q4], s=2, alpha=0.25, c='C3')
+        pl.scatter(lap_sens[np.logical_or(q3, q4)], mes_sens[np.logical_or(q3, q4)], s=2, alpha=0.25, c='k')
+        pl.scatter(lap_sens[q1], mes_sens[q1], s=2, alpha=0.25, c='C0')
+        pl.scatter(lap_sens[q2], mes_sens[q2], s=2, alpha=0.25, c='C3')
         pl.plot([0, 1], [me_threshold, me_threshold], 'k--')
-        pl.plot([nl_threshold, nl_threshold], [0, 1], 'k--')
+        pl.plot([lscore_th, lscore_th], [0, 1], 'k--')
         pl.text(0.25, 0.75, np.sum(q1))
         pl.text(0.25, 0.25, np.sum(q2))
         pl.text(0.75, 0.75, np.sum(q3))
         pl.text(0.75, 0.25, np.sum(q4))
         pl.xlim(-0.01, 1.01)
         pl.ylim(-0.01, 1.01)
-        pl.xlabel("Nonlinearity probability")
+        pl.xlabel("Linear model approximation $R^2$")
         pl.ylabel("2nd order model $R^2$")
         sns.despine()
-        fig.savefig(path.join(plot_dir, f"mescore_vs_nlprob_sensory_units.{ext}"), dpi=300)
+        fig.savefig(path.join(plot_dir, f"mescore_vs_linapproxscore_sensory_units.{ext}"), dpi=300)
 
         #######################################
         # Plot per-experiment neurons to check
@@ -850,23 +993,6 @@ if __name__ == "__main__":
                    all_centroids_px[above_thresh][np.logical_and(sensory_cluster, abt_in_olf), 0], s=2)
         pl.axis('equal')
         fig.savefig(path.join(plot_dir, f"Stim_Neuron_Loc_OlfEpith.{ext}"), dpi=900)
-
-        # Plot enriched regions by complexity for sensory neurons - we focus on sensory neurons
-        # since more sensory neurons are nonlinear and enrichment would otherwise simply
-        # reflect that fact
-        complexity = np.hstack(df_fit["complexity"])
-        c0 = np.logical_and(complexity == 0, sensory_cluster)  # linear
-        c1 = np.logical_and(complexity == 1, sensory_cluster)  # nonlinear and 2nd order model can fit response
-        c2 = np.logical_and(complexity == 2, sensory_cluster)  # nonlinear and 2nd order model cannot fit response
-        plot_region_enrichment(c0, sensory_cluster, mask_outlines, brain_outline_top,
-                               brain_outline_side, "Complexity0", regions_for_overview,
-                               region_mship[above_thresh][:, ix_overview])
-        plot_region_enrichment(c1, sensory_cluster, mask_outlines, brain_outline_top,
-                               brain_outline_side, "Complexity1", regions_for_overview,
-                               region_mship[above_thresh][:, ix_overview])
-        plot_region_enrichment(c2, sensory_cluster, mask_outlines, brain_outline_top,
-                               brain_outline_side, "Complexity2", regions_for_overview,
-                               region_mship[above_thresh][:, ix_overview])
 
         # Plot enriched regions for motor types
         motor_assigned = np.logical_or(start_cluster, np.logical_or(ang_cluster, disp_cluster))

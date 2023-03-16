@@ -137,17 +137,16 @@ def save_experiment_list(datafile: h5py.File, experiment_ids: np.ndarray, experi
 
 
 def get_raw_data(datafile: h5py.File) -> pd.DataFrame:
-    keys = ["neuron_id", "ann_corr", "lm_corr", "ann_sh_corr", "lm_sh_corr", "nl_prob", "me_score", "curvature", "nlc",
+    keys = ["neuron_id", "ann_corr", "lm_corr", "ann_sh_corr", "lm_sh_corr", "linear_model_score", "me_score",
             "ann_train_corr", "taylor_r2", "is_ann_fit", "is_lm_fit"]
     return dataframe_from_hdf5(datafile, "raw_data", keys)
 
 
 def save_raw_data(datafile: h5py.File, ann_corrs: np.ndarray, lm_corrs: np.ndarray, ann_sh_corrs: np.ndarray,
-                  lm_sh_corrs: np.ndarray, nl_probs: np.ndarray, me_scores: np.ndarray, curvatures: np.ndarray,
-                  nlcs: np.ndarray, ann_train_corrs: np.ndarray, taylor_r2s: np.ndarray, abt_ann: np.ndarray,
-                  abt_lm: np.ndarray):
-    if not check_arg_sizes(ann_corrs, lm_corrs, ann_sh_corrs, lm_sh_corrs, nl_probs, me_scores, curvatures, nlcs,
-                           ann_train_corrs, taylor_r2s, abt_ann, abt_lm):
+                  lm_sh_corrs: np.ndarray, lin_model_scores: np.ndarray, me_scores: np.ndarray,
+                  ann_train_corrs: np.ndarray, taylor_r2s: np.ndarray, abt_ann: np.ndarray, abt_lm: np.ndarray):
+    if not check_arg_sizes(ann_corrs, lm_corrs, ann_sh_corrs, lm_sh_corrs, lin_model_scores, me_scores, ann_train_corrs,
+                           taylor_r2s, abt_ann, abt_lm):
         raise ValueError("All inputs must have the same size along dimension 0")
     grp = datafile.create_group("raw_data")
     grp.create_dataset("neuron_id", data=np.arange(ann_corrs.size))
@@ -155,10 +154,8 @@ def save_raw_data(datafile: h5py.File, ann_corrs: np.ndarray, lm_corrs: np.ndarr
     grp.create_dataset("lm_corr", data=lm_corrs)
     grp.create_dataset("ann_sh_corr", data=ann_sh_corrs)
     grp.create_dataset("lm_sh_corr", data=lm_sh_corrs)
-    grp.create_dataset("nl_prob", data=nl_probs)
+    grp.create_dataset("linear_model_score", data=lin_model_scores)
     grp.create_dataset("me_score", data=me_scores)
-    grp.create_dataset("curvature", data=curvatures)
-    grp.create_dataset("nlc", data=nlcs)
     grp.create_dataset("ann_train_corr", data=ann_train_corrs)
     grp.create_dataset("taylor_r2", data=taylor_r2s)
     grp.create_dataset("is_ann_fit", data=abt_ann)
@@ -455,7 +452,7 @@ def build_zbrain_region_barcodes(cent_px: np.ndarray, region_names: List[str], z
     return rval
 
 
-def get_data(base_folder: str, e_folder: str, eid: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+def get_data(base_folder: str, e_folder: str, eid: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
                                                                  np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                                                                  np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                                                                  np.ndarray]:
@@ -467,17 +464,16 @@ def get_data(base_folder: str, e_folder: str, eid: int) -> Tuple[np.ndarray, np.
     :return:
         [0]: The test correlations of all n units in the experiment
         [1]: n x terms (x n_boot) array of taylor component scores
-        [2]: n long vector of curvature metrics
-        [3]: n long vector of experiment IDs
-        [4]: n x 3 matrix of unit reference brain centroids
-        [5]: n long vector of nlc metric scores
-        [6]: n long vector of glutamate channel brightness
-        [7]: n long vector of linear model test correlations
-        [8]: n x (n_timepointsxn_predictors) matrix of all jacobians at the data mean => linear receptive fields
-        [9]: n long vector of data mean expansion scores
-        [10]: n long vector of the planes each neuron came frome
-        [11]: n long vector of ann training correlations
-        [12]: n long vector of full taylor R2
+        [2]: n long vector of experiment IDs
+        [3]: n x 3 matrix of unit reference brain centroids
+        [4]: n long vector of linear approximation model scores
+        [5]: n long vector of glutamate channel brightness
+        [6]: n long vector of linear model test correlations
+        [7]: n x (n_timepointsxn_predictors) matrix of all jacobians at the data mean => linear receptive fields
+        [8]: n long vector of data mean expansion scores
+        [9]: n long vector of the planes each neuron came frome
+        [10]: n long vector of ann training correlations
+        [11]: n long vector of full taylor R2
     """
     datafile_path = path.join(base_folder, path.join(e_folder, f"{e_folder}_ANN_analysis.hdf5"))
     centroidfile_path = path.join(base_folder, path.join("CellCoordinates",
@@ -490,10 +486,9 @@ def get_data(base_folder: str, e_folder: str, eid: int) -> Tuple[np.ndarray, np.
         train_corrs = dfile["correlations_trained"][()]
         lm_test_corrs = dfile["lm_correlations_test"][()]
         taylor_scores = dfile["taylor_by_pred"][()]
-        curve_metrics = dfile["avg_curvatures"][()]
-        nlc_metrics = dfile["nlc_metrics"][()]
+        linear_model_scores = dfile["linear_model_score"][()]
         n_planes = dfile["n_planes"][()]
-        me_scores = dfile["mean_expansion_score"][()]**2  # immediately store as R2 not correlation coefficient
+        me_scores = dfile["mean_expansion_score"][()]
         taylor_r2 = dfile["taylor_full"][()]**2
         for p_id in range(n_planes):
             plane_group = dfile[f"{p_id}"]
@@ -503,14 +498,14 @@ def get_data(base_folder: str, e_folder: str, eid: int) -> Tuple[np.ndarray, np.
     glut_channel = np.hstack(glut_channel)
     plane_ids = np.hstack(plane_ids)
     assert glut_channel.shape[0] == test_corrs.size
-    if test_corrs.size != taylor_scores.shape[0] or test_corrs.size != curve_metrics.size:
+    if test_corrs.size != taylor_scores.shape[0] or test_corrs.size != linear_model_scores.size:
         raise ValueError(f"Analyzed metrics in experiment {e_folder} have mismatching sizes")
-    exp_ids = np.full(curve_metrics.size, eid)
+    exp_ids = np.full(linear_model_scores.size, eid)
     centroids = np.genfromtxt(centroidfile_path, delimiter=',', skip_header=True)
     cent_nan = np.full(4, np.nan)
     centroids[centroids[:, 3] == 1, :] = cent_nan
     centroids = centroids[:, :3].copy()
-    return test_corrs, taylor_scores, curve_metrics, exp_ids, centroids, nlc_metrics, glut_channel, lm_test_corrs,\
+    return test_corrs, taylor_scores, exp_ids, centroids, linear_model_scores, glut_channel, lm_test_corrs,\
         jacobian, me_scores, plane_ids, train_corrs, taylor_r2
 
 
@@ -530,18 +525,18 @@ def get_data_sh(base_folder: str, e_folder: str) -> Tuple[np.ndarray, np.ndarray
     return test_corrs, lm_test_corrs
 
 
-def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, lm_thresh: float, me_thresh: float,
-         save_activity: bool, outfile: str):
+def main(folder: str, c_thresh: float, sig_thresh: float, lm_thresh: float, me_thresh: float, save_activity: bool,
+         outfile: str, min_lin_approx: float):
     """
     Runs analysis
     :param folder: The folder with experiment hdf5 files and ann analysis subfolders
     :param c_thresh: The correlation threshold above which to consider units
     :param sig_thresh: The taylor metric threshold - metrics not significantly above this will be set to 0
-    :param nonlin_thresh: The threshold for considering a neuron nonlinear
     :param lm_thresh: The threshold for considering a neuron identified by the linear comparison model
     :param me_thresh: The threshold on the mean expansion R2 to consider the neuron describable by a 2nd order model
     :param save_activity: If true, calcium data for all neurons will be saved to the file as well
     :param outfile: The name of the output file
+    :param min_lin_approx: The threshold of the linear approximation score below which unit is considered nonlinear
     """
     experiment_ids, experiment_names = [], []  # to relate experiment ids with their respective names
     # get list of ANN analysis subfolders
@@ -566,15 +561,13 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
     # the raw taylor scores which include bootstrap information
     all_taylor_scores_raw = []
     # the curvature metrics
-    all_curve_metrics = []
+    all_linear_model_scores = []
     # the experiment ids for each neuron
     all_exp_ids = []
     # the plane that each neuron came from
     all_plane_ids = []
     # the centroids of each neuron
     all_centroids = []
-    # the nlc values
-    all_nlc_metrics = []
     # the vglut channel brightness of each neuron
     all_vglut = []
     # the jacobians at the data mean (=receptive field) of each neuron
@@ -589,7 +582,7 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
         info_dict["Experiment name"].append(flder)
         experiment_ids.append(i)
         experiment_names.append(flder.encode())
-        tc, ts, cm, ei, cn, nlc, vg, lmtc, jacs, mescores, pids, trainc, taylorr2 = get_data(folder, flder, i)
+        tc, ts, ei, cn, lams, vg, lmtc, jacs, mescores, pids, trainc, taylorr2 = get_data(folder, flder, i)
         info_dict["N Caiman"].append(np.sum(np.isfinite(tc)))
         info_dict["N Fit"].append(np.sum(tc >= c_thresh))
         info_dict["N Cent. mapped"].append(np.sum(np.logical_and(tc >= c_thresh, np.isfinite(cn[:, 0]))))
@@ -599,11 +592,10 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
         all_test_corrs_sh.append(tc_sh)
         all_lm_tc_sh.append(lm_tc_sh)
         all_taylor_scores_raw.append(ts)
-        all_curve_metrics.append(cm)
+        all_linear_model_scores.append(lams)
         all_exp_ids.append(ei)
         all_plane_ids.append(pids)
         all_centroids.append(cn)
-        all_nlc_metrics.append(nlc)
         all_vglut.append(vg)
         all_jacobians.append(jacs)
         all_mescores.append(mescores)
@@ -632,8 +624,7 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
     taylor_sig: np.ndarray = all_taylor_scores_raw[:, :, 0] - n_sigma * all_taylor_scores_raw[:, :, 1] - sig_thresh
     all_taylor_scores: np.ndarray = all_taylor_scores_raw[:, :, 0]
     all_taylor_scores[taylor_sig <= 0] = 0
-    all_curve_metrics = np.hstack(all_curve_metrics)
-    all_nlc_metrics = np.hstack(all_nlc_metrics)
+    all_linear_model_scores = np.hstack(all_linear_model_scores)
     all_exp_ids = np.hstack(all_exp_ids)
     all_plane_ids = np.hstack(all_plane_ids)
     all_jacobians = np.vstack(all_jacobians)
@@ -652,13 +643,8 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
     vg_thresh = 1.5
     glutamatergic = all_vglut > vg_thresh
 
-    # compute nonlinearity probabilities
-    nonlin_lrm = utilities.NonlinClassifier.get_standard_model()
-    nl_probs = nonlin_lrm.nonlin_probability(all_curve_metrics[above_thresh_ann], all_nlc_metrics[above_thresh_ann])
-    nonl_probabilities = np.full_like(all_curve_metrics, np.nan)
-    nonl_probabilities[above_thresh_ann] = nl_probs
-
-    is_nonlinear = nl_probs > nonlin_thresh
+    # assign nonlinearity
+    is_nonlinear = all_linear_model_scores[above_thresh_ann] < min_lin_approx
 
     # extract barcode labels
     # load taylor metric names from file and prepend "Nonlin"
@@ -715,7 +701,7 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
     with h5py.File(os.path.join(folder, outfile), "w") as main_file:
         main_file.create_dataset("ANN test correlation threshold", data=c_thresh)
         main_file.create_dataset("Taylor threshold", data=sig_thresh)
-        main_file.create_dataset("Nonlinearity threshold", data=nonlin_thresh)
+        main_file.create_dataset("Linear model score threshold", data=min_lin_approx)
         main_file.create_dataset("Linear model threshold", data=lm_thresh)
         main_file.create_dataset("Mean expansion R2 threshold", data=me_thresh)
         main_file.create_dataset("Taylor corrected significance", data=(1-min_significance))
@@ -726,9 +712,9 @@ def main(folder: str, c_thresh: float, sig_thresh: float, nonlin_thresh: float, 
         main_file.create_dataset("Behavior names", data=behavior_names)
         save_neuron_list(main_file, all_exp_ids, all_plane_ids, all_centroids, above_thresh_ann, glutamatergic)
         save_experiment_list(main_file, np.hstack(experiment_ids), np.hstack(experiment_names))
-        save_raw_data(main_file, all_test_corrs, all_lm_test_corrs, all_test_corrs_sh, all_lm_tc_sh, nonl_probabilities,
-                      all_mescores, all_curve_metrics, all_nlc_metrics, all_ann_train_corrs, all_taylor_r2,
-                      above_thresh_ann, above_thresh_lm)
+        save_raw_data(main_file, all_test_corrs, all_lm_test_corrs, all_test_corrs_sh, all_lm_tc_sh,
+                      all_linear_model_scores, all_mescores, all_ann_train_corrs, all_taylor_r2, above_thresh_ann,
+                      above_thresh_lm)
         save_fit_neurons(main_file, ann_fit_neuron_ids, ann_fit_is_lm_fit, all_centroids[above_thresh_ann, :], barcode,
                          all_jacobians, all_fit_jac_cluster_ids, complexity, glutamatergic[above_thresh_ann])
         s, p, e = extract_stimuli(folder, sub_folder_list)
@@ -757,9 +743,10 @@ if __name__ == "__main__":
                           default=np.sqrt(0.5))
     a_parser.add_argument("-si", "--sigthresh", help="The threshold for taylor metric significance", type=float,
                           default=0.1)
-    a_parser.add_argument("-nl", "--nlthresh", help="The threshold of nonlinearity", type=float, default=0.5)
     a_parser.add_argument("-lm", "--lmthresh", help="The threshold of lm fit test correlation", type=float,
                           default=np.sqrt(0.5))
+    a_parser.add_argument("-la", "--laprxthresh", help="The threshold of the linear approximation score", type=float,
+                          default=0.8)
     a_parser.add_argument("-me", "--methresh", help="The threshold of the R2 for considering neuron fit by 2nd order "
                                                     "model around the data mean.", type=float, default=0.5)
     a_parser.add_argument("-svc", "--save_ca", help="If set calcium data will be saved", action='store_true')
@@ -770,10 +757,10 @@ if __name__ == "__main__":
     data_folder = cl_args.folder
     corr_th = cl_args.corrthresh
     sig_th = cl_args.sigthresh
-    nl_th = cl_args.nlthresh
     lm_th = cl_args.lmthresh
     me_th = cl_args.methresh
     svc = cl_args.save_ca
     ofile = cl_args.output
+    la_th = cl_args.laprxthresh
 
-    main(data_folder, corr_th, sig_th, nl_th, lm_th, me_th, svc, ofile)
+    main(data_folder, corr_th, sig_th, lm_th, me_th, svc, ofile, la_th)

@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+"""
+Module written by Jamie D. Costabile for performant computation of the nonlinearity coefficient (NLC)
+"""
 
 import numpy as np
 import tensorflow as tf

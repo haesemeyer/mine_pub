@@ -47,10 +47,10 @@ class TaylorMap:
         Create a new TaylorMap object
         :param session_group: The session for which to do the mapping
         """
-        # load nonlinearity probabilities to use them to indicate to us which fits were above threshold so that
+        # load linear approximation scores to use them to indicate to us which fits were above threshold so that
         # Taylor metrics got computed
-        nlp = session_group["output_data"]["nl_probs"][()]
-        valid = np.isfinite(nlp)
+        lap = session_group["output_data"]["model_lin_approx_scores"][()]
+        valid = np.isfinite(lap)
         spatial = session_group["input_data"]["spatial"][()]
         self.image_dims = (spatial.shape[1], spatial.shape[2])
         # we weight all component related data by how much the model can actually explain
@@ -216,16 +216,18 @@ def main(cl_args):
         sns.despine()
         fig.savefig(path.join(plot_dir, f"Fraction_Identified.{ext}"), dpi=300)
 
-        # collect all nonlinearity probabilities
-        all_nl_probs = np.hstack([sg["output_data"]["nl_probs"][()] for sg in session_groups])
+        # collect all linear approximation scores
+        all_linapx_scores = np.hstack([sg["output_data"]["model_lin_approx_scores"][()] for sg in session_groups])
         # kde-plot of nonlinearity probabilities
         fig = pl.figure()
-        sns.kdeplot(all_nl_probs)
+        sns.kdeplot(all_linapx_scores)
         pl.xlim(0, 1)
-        pl.xlabel("Nonlinearity probability")
+        pl.xlabel("Linear approximation score $R^2$")
         pl.ylabel("Density")
         sns.despine()
-        fig.savefig(path.join(plot_dir, f"Nonlinearity_KDE.{ext}"), dpi=300)
+        fig.savefig(path.join(plot_dir, f"LinearApproximation_KDE.{ext}"), dpi=300)
+
+        print(f"Fraction of nonlinear neurons: {np.sum(all_linapx_scores<0.8)/np.sum(np.isfinite(all_linapx_scores))}")
 
         # collect all Taylor scores - NOTE: The following is only sensible if the predictor labels are
         # the same across all sessions, so we make sure of that

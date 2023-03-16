@@ -271,7 +271,8 @@ def analyze_experiment(file_path: str, file_name: str, use_dff: bool, overwrite:
     n_above_t = 0
     lm_n_above_t = 0
 
-    with h5py.File(path.join(ana_dir, f"{ana_dir_name}_ANN_analysis.hdf5"), open_flag) as dfile:
+    with h5py.File(path.join(ana_dir, f"{ana_dir_name}_ANN_analysis.hdf5"), open_flag) as dfile,\
+            h5py.File(path.join(ana_dir, f"{ana_dir_name}_fit_models.hdf5"), open_flag) as model_file:
         dfile.create_dataset(name="use_dff", data=use_dff)
         dfile.create_dataset(name="n_planes", data=len(all_calcium_traces))
         # loop over planes
@@ -320,7 +321,7 @@ def analyze_experiment(file_path: str, file_name: str, use_dff: bool, overwrite:
                     correlations_test.append(np.nan)
                     lm_correlations_test.append(np.nan)
                     continue
-                model_save_name = path.join(ana_dir, f"M_plane_{p_id}_cell_{cell_ix}_trained")
+                model_save_group = f"M_plane_{p_id}_cell_{cell_ix}_trained"
                 plane_ids.append(p_id)
                 cell_indices.append(cell_ix)
                 tset = data.training_data(cell_ix, batch_size=256)
@@ -329,7 +330,9 @@ def analyze_experiment(file_path: str, file_name: str, use_dff: bool, overwrite:
                 m(np.random.randn(1, hist_steps, len(data.regressors)).astype(np.float32))
                 # train
                 model.train_model(m, tset, n_epochs, c_traces.shape[1])
-                m.save_weights(model_save_name)
+                model_weights = m.get_weights()
+                w_group = model_file.create_group(model_save_group)
+                utilities.modelweights_to_hdf5(w_group, model_weights)
                 # evaluate
                 p, r = data.predict_response(cell_ix, m)
                 c_tr = np.corrcoef(p[:train_frames], r[:train_frames])[0, 1]

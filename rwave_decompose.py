@@ -7,7 +7,7 @@ import os
 from os import path
 
 import utilities
-from taylorDecomp import all_decomposition_metrics, d2ca_dr2, data_mean_prediction
+from taylorDecomp import taylor_decompose, d2ca_dr2, complexity_scores
 import h5py
 import numpy as np
 from multiprocessing import Pool
@@ -16,7 +16,6 @@ from typing import Optional, Dict, List, Any
 import model
 from utilities import create_overwrite, Data
 import argparse
-from perf_nlc_nonlin import calc_nlc
 
 
 class CheckArgs(argparse.Action):
@@ -60,12 +59,13 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
     hist_steps = 5 * 10  # 10s history at 5Hz
 
     datafile_path = path.join(base_folder, path.join(e_folder, f"{e_folder}_ANN_analysis.hdf5"))
+    modelfile_path = path.join(base_folder, path.join(e_folder, f"{e_folder}_fit_models.hdf5"))
     if not path.exists(datafile_path):
         print(f"Error {datafile_path} does not exist")
         return -2
-    with h5py.File(datafile_path, 'a') as dfile:
+    with h5py.File(datafile_path, 'a') as dfile, h5py.File(modelfile_path, 'r') as model_file:
         # if this file has already been analyzed and we do not intend to overwrite, skip
-        if "avg_curvatures" in dfile and not ovr:
+        if "linear_model_score" in dfile and not ovr:
             return -1
         test_corrs = dfile["correlations_test"][()]
         plane_ids = dfile["plane_ids"][()]
@@ -74,16 +74,14 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
         init_in: Optional[np.ndarray] = None
         data: Optional[Data] = None
         n_predictors = None
-        avg_curvatures = np.full(test_corrs.size, np.nan)  # for each neuron the nonlinearity metric
-        nlc_metrics = np.full(test_corrs.size, np.nan)
-        taylor_full = np.full_like(avg_curvatures, np.nan)  # for each neuron the overall taylor correlation
-        me_score = np.full_like(avg_curvatures, np.nan)  # for each neuron the correlation of expansion around data mean
+        lin_model_scores = np.full(test_corrs.size, np.nan)  # for each neuron the score of the linear approximation
+        taylor_full = np.full_like(lin_model_scores, np.nan)  # for each neuron the overall taylor correlation
+        me_score = np.full_like(lin_model_scores, np.nan)  # for each neuron the score of the 2nd order model approx.
         # for each neuron and each taylor term the correlation to the true response
         # size will depend on number of predictors in the experiment. Therefore initialize later
         taylor_by_pred: Optional[np.ndarray] = None
         all_jacobians: Optional[np.ndarray] = None
         all_hessians: Optional[np.ndarray] = None
-        all_plane_curvatures: Dict[int, List] = {}  # the curvature trace for each above-threshold neuron in each plane
         all_plane_abt_indices: Dict[int, List] = {}  # the cell indices for each above-threshold neuron in each plane
         all_plane_by_pred: Dict[int, List] = {}  # for each above-threshold neuron in each plane the taylor by predictor
         all_plane_true_change: Dict[int, List] = {}  # for each abt neuron in each plane the true network change
@@ -91,7 +89,6 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
             if curr_plane != pid:
                 # load the data structure for this plane
                 data = Data.load_direct(dfile[f"{pid}"])
-                all_plane_curvatures[pid] = []
                 all_plane_abt_indices[pid] = []
                 all_plane_by_pred[pid] = []
                 all_plane_true_change[pid] = []
@@ -115,20 +112,23 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
                 all_hessians = np.full((test_corrs.size, hist_steps*n_predictors, hist_steps*n_predictors), np.nan)
                 # load and initialize model
                 m = model.get_standard_model(hist_steps)
-            m.load_weights(path.join(base_folder, path.join(e_folder,
-                                                            f"M_plane_{pid}_cell_{cid}_trained"))).expect_partial()
+            model_save_group = f"M_plane_{pid}_cell_{cid}_trained"
+            w_group = model_file[model_save_group]
+            weights = utilities.modelweights_from_hdf5(w_group)
+            m(init_in)
+            m.set_weights(weights)
             m(init_in)  # this will initialize the weights
-            true_change, pred_change, by_pred, avg_curve, all_curves = all_decomposition_metrics(m, predictors, 5, 25)
+            true_change, pred_change, by_pred = taylor_decompose(m, predictors, 5, 25)
             jacobian, hessian = d2ca_dr2(m, x_bar)
+            lin_score, o2_score = complexity_scores(m, x_bar, jacobian, hessian, predictors, 5)
 
             # Compute prediction of Taylor expanding our network around the data-mean instead of prediction ahead as
             # above which always computes a new jacobian and hessian (the prediction here is akin to representing
             # the whole ANN with a linear model containing all first-order interaction terms):
             # Specifically, the distance to the data-mean x_bar which is used to make the prediction
             # by adding dxJ + dxHdx to model(x_bar)
-            model_prediction, d_mean_prediction = data_mean_prediction(m, x_bar, jacobian, hessian, predictors, 5)
-            mean_pred_corr = np.corrcoef(model_prediction, d_mean_prediction)[0, 1]
-            me_score[i] = mean_pred_corr
+            me_score[i] = o2_score
+            lin_model_scores[i] = lin_score
 
             jacobian = jacobian.numpy().ravel()
             # reorder jacobian by n_predictor long chunks of hist_steps timeslices
@@ -137,15 +137,10 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
             hessian = np.reshape(hessian.numpy(), (x_bar.shape[2] * hist_steps, x_bar.shape[2] * hist_steps))
             hessian = utilities.rearrange_hessian(hessian, n_predictors, hist_steps)
             all_hessians[i, :, :] = hessian
-            nlc = calc_nlc(predictors, m)[0]
             all_plane_by_pred[pid].append(by_pred)
             all_plane_true_change[pid].append(true_change)
-            # store average nonlineaerity metric and overall taylor correlation as well as per plane curvature trace
-            avg_curvatures[i] = avg_curve
-            nlc_metrics[i] = nlc
             taylor_corr = np.corrcoef(true_change, pred_change)[0, 1]
             taylor_full[i] = taylor_corr
-            all_plane_curvatures[pid].append(all_curves)
             all_plane_abt_indices[pid].append(cid)
             # compute our by-predictor taylor importance as the fractional loss of r2 when excluding the component
             # add one extra "pseudo-component" which indicates the Taylor Metric when no behavior information is
@@ -183,8 +178,7 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
             taylor_by_pred[i, 1, 1] = np.std(bsample)
         retval = int(np.sum(test_corrs >= c_thresh))
         # store everything in the hdf5 file with overwrite if requested
-        create_overwrite(dfile, "avg_curvatures", avg_curvatures, ovr)
-        create_overwrite(dfile, "nlc_metrics", nlc_metrics, ovr)
+        create_overwrite(dfile, "linear_model_score", lin_model_scores, ovr)
         create_overwrite(dfile, "taylor_full", taylor_full, ovr)
         create_overwrite(dfile, "mean_expansion_score", me_score, ovr)
         create_overwrite(dfile, "taylor_by_pred", taylor_by_pred, ovr)
@@ -198,14 +192,12 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
         print(taylor_names)
         assert len(taylor_names) == taylor_by_pred.shape[1]
         create_overwrite(dfile, "taylor_names", np.vstack(taylor_names), ovr)
-        for pid in all_plane_curvatures.keys():
+        for pid in all_plane_abt_indices.keys():
             d_group = dfile[f"{pid}"]
-            plane_curves = all_plane_curvatures[pid]
             plane_indices = all_plane_abt_indices[pid]
             plane_true_change = all_plane_true_change[pid]
             plane_by_pred = all_plane_by_pred[pid]
             if len(plane_indices) > 1:
-                create_overwrite(d_group, "plane_curvatures", np.vstack(plane_curves), ovr, True)
                 create_overwrite(d_group, "above_t_cell_indices", np.hstack(plane_indices), ovr, True)
                 create_overwrite(d_group, "plane_true_change", np.vstack(plane_true_change), ovr, True)
                 # Note: The list comprehension below is neccesary since we need to expand the dimensions of each elemet
@@ -214,7 +206,6 @@ def analyze_experiment(base_folder: str, e_folder: str, c_thresh: float, ovr: bo
                 create_overwrite(d_group, "plane_by_pred", np.vstack([pbp[None, :] for pbp in plane_by_pred]), ovr,
                                  True)
             elif len(plane_indices) == 1:
-                create_overwrite(d_group, "plane_curvatures", plane_curves[0][None, :], ovr)
                 create_overwrite(d_group, "above_t_cell_indices", plane_indices[0], ovr)
                 create_overwrite(d_group, "plane_true_change", plane_true_change[0][None, :], ovr)
                 create_overwrite(d_group, "plane_by_pred", plane_by_pred[0][None, :], ovr)
@@ -286,7 +277,7 @@ if __name__ == "__main__":
     a_parser.add_argument("-f", "--folder", help="Path to folder with ANN fit subfolders", type=str, default="",
                           action=CheckArgs)
     a_parser.add_argument("-ct", "--corr_thresh", help="Threshold on test correlation to consider ANN fit for analysis",
-                          type=float, default=0.6)
+                          type=float, default=np.sqrt(0.5))
     a_parser.add_argument("-np", "--processes", help="The number of processes across which to parallelize computation.",
                           type=int, default=1, action=CheckArgs)
     a_parser.add_argument("-ovr", "--overwrite", help="If set analyzed experiments won't be skipped but re-analyzed",

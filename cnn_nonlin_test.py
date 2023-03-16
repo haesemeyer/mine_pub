@@ -2,29 +2,34 @@
 Script to test nonlinearity metrics
 """
 
+from scipy.stats.mstats import mquantiles
 import model
 import numpy as np
 import matplotlib.pyplot as pl
 import utilities
 import seaborn as sns
 import time
-from taylorDecomp import avg_directional_curvature
+from taylorDecomp import d2ca_dr2, complexity_scores, avg_directional_curvature
 import matplotlib as mpl
 import os
 from os import path
 from sklearn.metrics import auc
-from sklearn.linear_model import LogisticRegression
-from perf_nlc_nonlin import calc_nlc
 from typing import Tuple
 import h5py
+from perf_nlc_nonlin import calc_nlc
 
 
 def standardize(ar):
     return (ar - np.mean(ar)) / np.std(ar)
 
 
-def diff_predictor(predictor: np.ndarray) -> np.ndarray:
-    return np.r_[0, np.diff(predictor)]
+def diff_predictor(predictor: np.ndarray, d_len=10) -> np.ndarray:
+    if d_len < 2:
+        raise ValueError("d_len has to be 2 or larger")
+    f = np.zeros(d_len)
+    f[:d_len//2] = -1
+    f[d_len//2:] = 1
+    return np.convolve(predictor, f)[:predictor.size]
 
 
 def convolve_predictor(predictor: np.ndarray, tau_0: float, tau_1: float, scale: float) ->\
@@ -68,9 +73,10 @@ def roc_analysis(linear: np.ndarray, non_linear: np.ndarray, thresh_to_test: np.
     false_positive_rate = []
     true_positive_rate = []
     for th in thresh_to_test:
-        true_pos = np.sum(non_linear > th)
+        # NOTE: Our scores are a linearity metric not a non-linearity metric therefore <threshold comparison
+        true_pos = np.sum(non_linear < th)
         true_positive_rate.append(true_pos / non_linear.size)
-        false_pos = np.sum(linear > th)
+        false_pos = np.sum(linear < th)
         false_positive_rate.append(false_pos / linear.size)
     return np.hstack(true_positive_rate), np.hstack(false_positive_rate)
 
@@ -95,8 +101,8 @@ if __name__ == '__main__':
     train_frames = (time_base.size * 2) // 3
     n_epochs = 100
 
-    # granularity of nonlinearity determination
-    analyze_every = frame_rate * 5  # compute every 5 seconds
+    # granularity of complexity and curvature determination
+    analyze_every = frame_rate*5  # compute every five seconds
     look_ahead = frame_rate * 5  # use 5s look-ahead to compute input data direction
 
     # all signals are standardized to unit variance/sd - noise_fraction controls the standard deviation of the noise
@@ -111,7 +117,7 @@ if __name__ == '__main__':
     diffed /= np.std(diffed)
     regressors = [reg]
     # We will build responses from linear -> nonlinear by blending reg with power transformations of reg
-    rectified = rect_predictor(reg)
+    rectified = rect_predictor(reg, scale=3.0)
     rectified /= np.std(rectified)
     tanhsq = tanhsq_predictor(reg)
     tanhsq /= np.std(tanhsq)
@@ -144,10 +150,8 @@ if __name__ == '__main__':
     data = utilities.Data(hist_steps, regressors, ca_responses, train_frames)
     correlations_trained = []
     correlations_test = []
-    all_predictions = []
-    all_true_responses = []
-    all_avg_curvatures = []
-    all_nlc_values = []
+    all_sq_scores = []  # scores of the 2nd-order model
+    all_lin_scores = []  # scores of the 1st-order model
 
     for cell_ix in range(ca_responses.shape[0]):
         start = time.perf_counter()
@@ -159,8 +163,6 @@ if __name__ == '__main__':
         model.train_model(m, tset, n_epochs, ca_responses.shape[1])
         # evaluate
         p, r = data.predict_response(cell_ix, m)
-        all_predictions.append(p)
-        all_true_responses.append(r)
         c_tr = np.corrcoef(p[:train_frames], r[:train_frames])[0, 1]
         correlations_trained.append(c_tr)
         c_ts = np.corrcoef(p[train_frames:], r[train_frames:])[0, 1]
@@ -171,18 +173,30 @@ if __name__ == '__main__':
 
         regs = data.regressor_matrix(cell_ix)
         start = time.perf_counter()
-        avg_curve, all_curve = avg_directional_curvature(m, regs, look_ahead, analyze_every)
-        all_avg_curvatures.append(avg_curve)
+        # obtain data-mean and J and H at data mean
+        all_inputs = []
+        for inp, outp in tset:
+            all_inputs.append(inp.numpy())
+        x_bar = np.mean(np.vstack(all_inputs), 0, keepdims=True)
+        jacobian, hessian = d2ca_dr2(m, x_bar)
+        # compute complexity scores
+        lin_score, sq_score = complexity_scores(m, x_bar, jacobian, hessian, regs, analyze_every)
+        # NOTE: Since these are scores of a truncated model they can be < 0 to ease plotting and interpretation
+        # we set negative scores to 0 and hence collapse them to "no variance explained" instead of "less variance
+        # explained than the average output"
+        if lin_score < 0:
+            lin_score = 0
+        if sq_score < 0:
+            sq_score = 0
+        all_lin_scores.append(lin_score)
+        all_sq_scores.append(sq_score)
         stop = time.perf_counter()
-        print(f"Curvature calculation took {int(stop - start)} seconds; Avg curvature: {avg_curve}")
-        start = time.perf_counter()
-        nlc = calc_nlc(regs, m)[0]
-        all_nlc_values.append(nlc)
-        stop = time.perf_counter()
-        print(f"NLC calculation took {int(stop - start)} seconds; NLC: {nlc}")
+        print(f"Complexity calculation took {int(stop - start)} seconds; Linear model score: {lin_score}")
+        print(f"2nd order model score: {sq_score}")
         print()
 
-    all_avg_curvatures = np.hstack(all_avg_curvatures)
+    all_lin_scores = np.hstack(all_lin_scores)
+    all_sq_scores = np.hstack(all_sq_scores)
     correlations_test = np.hstack(correlations_test)
 
     # mixing effect of rectification
@@ -194,20 +208,20 @@ if __name__ == '__main__':
     ax_corr.set_xlabel("Nonlinear mix")
     ax_corr.set_ylabel("Test R2")
     ax_corr.set_ylim(0, 1)
-    ax_curve.plot(np.arange(10)/9, all_avg_curvatures[:10], 'ko')
-    ax_curve.plot(0, all_avg_curvatures[0], 'C0o')
-    ax_curve.plot(5/9, all_avg_curvatures[5], 'C1o')
-    ax_curve.plot(1, all_avg_curvatures[9], 'C2o')
-    ax_curve.set_ylim(0, np.max(all_avg_curvatures)+0.05)
+    ax_curve.plot(np.arange(10)/9, all_lin_scores[:10], 'ko')
+    ax_curve.plot(0, all_lin_scores[0], 'C0o')
+    ax_curve.plot(5/9, all_lin_scores[5], 'C1o')
+    ax_curve.plot(1, all_lin_scores[9], 'C2o')
+    ax_curve.set_ylim(0, np.max(all_lin_scores)+0.05)
     ax_curve.set_xlabel("Nonlinear mix")
-    ax_curve.set_ylabel("Curvature metric")
-    ax_nlc.plot(np.arange(10)/9, all_nlc_values[:10], 'ko')
-    ax_nlc.plot(0, all_nlc_values[0], 'C0o')
-    ax_nlc.plot(5/9, all_nlc_values[5], 'C1o')
-    ax_nlc.plot(1, all_nlc_values[9], 'C2o')
-    ax_nlc.set_ylim(0, np.max(all_nlc_values)+0.05)
+    ax_curve.set_ylabel("Linear model score")
+    ax_nlc.plot(np.arange(10)/9, all_sq_scores[:10], 'ko')
+    ax_nlc.plot(0, all_sq_scores[0], 'C0o')
+    ax_nlc.plot(5/9, all_sq_scores[5], 'C1o')
+    ax_nlc.plot(1, all_sq_scores[9], 'C2o')
+    ax_nlc.set_ylim(0, np.max(all_sq_scores)+0.05)
     ax_nlc.set_xlabel("Nonlinear mix")
-    ax_nlc.set_ylabel("NLC metric")
+    ax_nlc.set_ylabel("2nd order model score")
     fig.tight_layout()
     sns.despine(fig)
     fig.savefig(path.join(plot_dir, "RectificationMixing_Metrics.pdf"))
@@ -235,20 +249,20 @@ if __name__ == '__main__':
     ax_corr.set_xlabel("Nonlinear mix")
     ax_corr.set_ylabel("Test R2")
     ax_corr.set_ylim(0, 1)
-    ax_curve.plot(np.arange(10)/9, all_avg_curvatures[10:20], 'ko')
-    ax_curve.plot(0, all_avg_curvatures[10], 'C3o')
-    ax_curve.plot(5/9, all_avg_curvatures[15], 'C4o')
-    ax_curve.plot(1, all_avg_curvatures[19], 'C5o')
-    ax_curve.set_ylim(0, np.max(all_avg_curvatures)+0.05)
+    ax_curve.plot(np.arange(10)/9, all_lin_scores[10:20], 'ko')
+    ax_curve.plot(0, all_lin_scores[10], 'C3o')
+    ax_curve.plot(5/9, all_lin_scores[15], 'C4o')
+    ax_curve.plot(1, all_lin_scores[19], 'C5o')
+    ax_curve.set_ylim(0, np.max(all_lin_scores)+0.05)
     ax_curve.set_xlabel("Nonlinear mix")
-    ax_curve.set_ylabel("Curvature metric")
-    ax_nlc.plot(np.arange(10) / 9, all_nlc_values[10:20], 'ko')
-    ax_nlc.plot(0, all_nlc_values[10], 'C3o')
-    ax_nlc.plot(5 / 9, all_nlc_values[15], 'C4o')
-    ax_nlc.plot(1, all_nlc_values[19], 'C5o')
-    ax_nlc.set_ylim(0, np.max(all_nlc_values) + 0.05)
+    ax_curve.set_ylabel("Linear model score")
+    ax_nlc.plot(np.arange(10) / 9, all_sq_scores[10:20], 'ko')
+    ax_nlc.plot(0, all_sq_scores[10], 'C3o')
+    ax_nlc.plot(5 / 9, all_sq_scores[15], 'C4o')
+    ax_nlc.plot(1, all_sq_scores[19], 'C5o')
+    ax_nlc.set_ylim(0, np.max(all_sq_scores) + 0.05)
     ax_nlc.set_xlabel("Nonlinear mix")
-    ax_nlc.set_ylabel("NLC metric")
+    ax_nlc.set_ylabel("2nd order model score")
     fig.tight_layout()
     sns.despine(fig)
     fig.savefig(path.join(plot_dir, "TanhSqMixing_Metrics.pdf"))
@@ -276,20 +290,20 @@ if __name__ == '__main__':
     ax_corr.set_xlabel("Derivative mix")
     ax_corr.set_ylabel("Test R2")
     ax_corr.set_ylim(0, 1)
-    ax_curve.plot(np.arange(10) / 9, all_avg_curvatures[20:], 'ko')
-    ax_curve.plot(0, all_avg_curvatures[20], 'C6o')
-    ax_curve.plot(5 / 9, all_avg_curvatures[25], 'C7o')
-    ax_curve.plot(1, all_avg_curvatures[29], 'C8o')
-    ax_curve.set_ylim(0, np.max(all_avg_curvatures)+0.05)
+    ax_curve.plot(np.arange(10) / 9, all_lin_scores[20:], 'ko')
+    ax_curve.plot(0, all_lin_scores[20], 'C6o')
+    ax_curve.plot(5 / 9, all_lin_scores[25], 'C7o')
+    ax_curve.plot(1, all_lin_scores[29], 'C8o')
+    ax_curve.set_ylim(0, np.max(all_lin_scores)+0.05)
     ax_curve.set_xlabel("Derivative mix")
-    ax_curve.set_ylabel("Curvature metric")
-    ax_nlc.plot(np.arange(10) / 9, all_nlc_values[20:], 'ko')
-    ax_nlc.plot(0, all_nlc_values[20], 'C6o')
-    ax_nlc.plot(5 / 9, all_nlc_values[25], 'C7o')
-    ax_nlc.plot(1, all_nlc_values[29], 'C8o')
-    ax_nlc.set_ylim(0, np.max(all_nlc_values) + 0.05)
+    ax_curve.set_ylabel("Linear model score")
+    ax_nlc.plot(np.arange(10) / 9, all_sq_scores[20:], 'ko')
+    ax_nlc.plot(0, all_sq_scores[20], 'C6o')
+    ax_nlc.plot(5 / 9, all_sq_scores[25], 'C7o')
+    ax_nlc.plot(1, all_sq_scores[29], 'C8o')
+    ax_nlc.set_ylim(0, np.max(all_sq_scores) + 0.05)
     ax_nlc.set_xlabel("Derivative mix")
-    ax_nlc.set_ylabel("NLC metric")
+    ax_nlc.set_ylabel("2nd order model score")
     fig.tight_layout()
     sns.despine(fig)
     fig.savefig(path.join(plot_dir, "DerivativeMixing_Metrics.pdf"))
@@ -308,17 +322,18 @@ if __name__ == '__main__':
     sns.despine(fig)
     fig.savefig(path.join(plot_dir, "DerivativeMixing_ExampleCorrelations.pdf"))
 
-    # test stability of curvature and nlc metric across multiple random stimuli
+    # test stability of linear model prediction metric across multiple random stimuli
     n_stim = 500
-    curve_diffed = np.full(n_stim, np.nan)
-    curve_rect = np.full(n_stim, np.nan)
-    curve_tanhpow = np.full(n_stim, np.nan)
-    curve_conved = np.full(n_stim, np.nan)
+    lscore_diffed = np.full(n_stim, np.nan)
+    lscore_rect = np.full(n_stim, np.nan)
+    lscore_tanhpow = np.full(n_stim, np.nan)
+    lscore_conved = np.full(n_stim, np.nan)
 
-    nlc_diffed = np.full(n_stim, np.nan)
-    nlc_rect = np.full(n_stim, np.nan)
-    nlc_tanhpow = np.full(n_stim, np.nan)
-    nlc_conved = np.full(n_stim, np.nan)
+    # the following are for comparative purposees
+    all_lscore = []
+    all_sqscore = []
+    all_crv = []
+    all_nlc = []
 
     all_regressors = []
 
@@ -326,13 +341,11 @@ if __name__ == '__main__':
 
     for i in range(n_stim):
         # create regressor matrix
-        reg = utilities.create_random_wave_predictor(time_base)
+        reg = standardize(utilities.create_random_wave_predictor(time_base))
         reg2 = standardize(utilities.create_random_wave_predictor(time_base))
         reg3 = standardize(utilities.create_random_wave_predictor(time_base))
         reg4 = standardize(utilities.create_random_wave_predictor(time_base))
         reg5 = standardize(utilities.create_random_wave_predictor(time_base))
-        reg -= np.mean(reg)
-        reg /= np.std(reg)
         all_regressors.append(reg)
         regressors = [reg, reg2, reg3, reg4, reg5]
         # create responses
@@ -343,14 +356,15 @@ if __name__ == '__main__':
         all_filters.append(flter)
         conved -= np.mean(conved)
         conved /= np.std(conved)
-        s = np.random.uniform(1.0, 5.0)
+        s = np.random.uniform(2.0, 5.0)
         o = np.random.uniform(1.0, 5.0)
         rectified = rect_predictor(reg, s, o)
         rectified /= np.std(rectified)
         e = np.random.randint(1, 5)
         tanhsq = tanhsq_predictor(reg, e)
         tanhsq /= np.std(tanhsq)
-        diffed = diff_predictor(reg)
+        dif_len = np.random.randint(2, 15)
+        diffed = diff_predictor(reg, dif_len)
         diffed -= np.mean(diffed)
         diffed /= np.std(diffed)
 
@@ -380,154 +394,165 @@ if __name__ == '__main__':
             print(f"Training took {int(stop - start)} seconds. {i*4+cell_ix} of {n_stim*4} models completed.")
             regs = data.regressor_matrix(cell_ix)
             start = time.perf_counter()
-            avg_curve = avg_directional_curvature(m, regs, look_ahead, analyze_every)[0]
+            # obtain data-mean and J and H at data mean
+            all_inputs = []
+            for inp, outp in tset:
+                all_inputs.append(inp.numpy())
+            x_bar = np.mean(np.vstack(all_inputs), 0, keepdims=True)
+            jacobian, hessian = d2ca_dr2(m, x_bar)
+            # compute complexity scores
+            lin_score, sq_score = complexity_scores(m, x_bar, jacobian, hessian, regs, analyze_every)
+            # NOTE: Since these are scores of a truncated model they can be < 0 to ease plotting and interpretation
+            # we set negative scores to 0 and hence collapse them to "no variance explained" instead of "less variance
+            # explained than the average output"
+            if lin_score < 0:
+                lin_score = 0
+            if sq_score < 0:
+                sq_score = 0
+            # store in our all-score variables
+            all_lscore.append(lin_score)
+            all_sqscore.append(sq_score)
             stop = time.perf_counter()
+            # store according to type for linear vs. nonlinear comparison
             if cell_ix == 0:
-                curve_diffed[i] = avg_curve
+                lscore_diffed[i] = lin_score
+                print("Diffed")
             elif cell_ix == 1:
-                curve_rect[i] = avg_curve
+                lscore_rect[i] = lin_score
+                print("Rectified")
             elif cell_ix == 2:
-                curve_tanhpow[i] = avg_curve
+                lscore_tanhpow[i] = lin_score
+                print("Tanhpow")
             elif cell_ix == 3:
-                curve_conved[i] = avg_curve
+                lscore_conved[i] = lin_score
+                print("Convolved")
             else:
                 raise Exception("Unknown response type encountered")
+            print(f"Complexity calculation took {int(stop - start)} seconds; Linear model score: {lin_score}")
+            print(f"2nd order model score: {sq_score}")
+            start = time.perf_counter()
+            avg_curve = avg_directional_curvature(m, regs, look_ahead, analyze_every)[0]
+            all_crv.append(avg_curve)
+            stop = time.perf_counter()
             print(f"Curvature calculation took {int(stop - start)} seconds; Avg curvature: {avg_curve}")
             start = time.perf_counter()
             nlc = calc_nlc(regs, m)[0]
+            all_nlc.append(nlc)
             stop = time.perf_counter()
-            if cell_ix == 0:
-                nlc_diffed[i] = nlc
-            elif cell_ix == 1:
-                nlc_rect[i] = nlc
-            elif cell_ix == 2:
-                nlc_tanhpow[i] = nlc
-            elif cell_ix == 3:
-                nlc_conved[i] = nlc
-            else:
-                raise Exception("Unknown response type encountered")
             print(f"NLC calculation took {int(stop - start)} seconds; NLC: {nlc}")
+
         print()
 
-    # curvature across conditions
-    fig = pl.figure()
-    sns.kdeplot(data=curve_diffed, cut=0, label='derivative')
-    sns.kdeplot(data=curve_rect, cut=0, label='rectified')
-    sns.kdeplot(data=curve_tanhpow, cut=0, label='$tanh^n$')
-    sns.kdeplot(data=curve_conved, cut=0, label='convolved')
-    pl.legend()
-    pl.xlabel("Curvature metric")
-    pl.ylabel("Density")
-    sns.despine()
-    fig.savefig(path.join(plot_dir, "CurvatureDistribution.pdf"))
+    all_lscore = np.hstack(all_lscore)
+    all_sqscore = np.hstack(all_sqscore)
+    all_crv = np.hstack(all_crv)
+    all_nlc = np.hstack(all_nlc)
 
-    # NLC across conditions
-    fig = pl.figure()
-    sns.kdeplot(data=nlc_diffed, cut=0, label='derivative')
-    sns.kdeplot(data=nlc_rect, cut=0, label='rectified')
-    sns.kdeplot(data=nlc_tanhpow, cut=0, label='$tanh^n$')
-    sns.kdeplot(data=nlc_conved, cut=0, label='convolved')
+    # linear model scrore across conditions
+    pl.figure()
+    sns.kdeplot(data=lscore_diffed, cut=0, label='derivative')
+    sns.kdeplot(data=lscore_rect, cut=0, label='rectified')
+    sns.kdeplot(data=lscore_tanhpow, cut=0, label='$tanh^n$')
+    sns.kdeplot(data=lscore_conved, cut=0, label='convolved')
     pl.legend()
-    pl.xlabel("NLC metric")
+    pl.xlabel("Linear model metric")
     pl.ylabel("Density")
     sns.despine()
-    fig.savefig(path.join(plot_dir, "NLCDistribution.pdf"))
+
+    score_bins = np.linspace(0, 1, 100)
+    fig = pl.figure()
+    pl.hist(lscore_diffed, score_bins, density=True, label='derivative', histtype='step')
+    pl.hist(lscore_rect, score_bins, density=True, label='rectified', histtype='step', linestyle='dashed')
+    pl.hist(lscore_tanhpow, score_bins, density=True, label='$tanh^n$', histtype='step', linestyle='dashed')
+    pl.hist(lscore_conved, score_bins, density=True, label='convolved', histtype='step')
+    pl.legend()
+    pl.xlabel("Linear model metric")
+    pl.ylabel("Density")
+    sns.despine()
+    fig.savefig(path.join(plot_dir, "Linear_model_score_Distribution.pdf"))
 
     # ROC analysis
-    all_linear_crv = np.hstack((curve_diffed, curve_conved))
-    all_nonlinear_crv = np.hstack((curve_rect, curve_tanhpow))
+    all_linear_score = np.hstack((lscore_diffed, lscore_conved))
+    all_nonlinear_score = np.hstack((lscore_rect, lscore_tanhpow))
     # test thresholds
-    ttt_crv = np.linspace(0, np.max(np.hstack((all_linear_crv, all_nonlinear_crv))), 1000)
-
-    all_linear_nlc = np.hstack((nlc_diffed, nlc_conved))
-    all_nonlinear_nlc = np.hstack((nlc_rect, nlc_tanhpow))
-    ttt_nlc = np.linspace(0, np.max(np.hstack((all_linear_nlc, all_nonlinear_nlc))), 1000)
+    ttt_score = np.linspace(0, 1, 1000)
 
     # calculate true and false positive rates
-    tpr_crv, fpr_crv = roc_analysis(all_linear_crv, all_nonlinear_crv, ttt_crv)
-    tpr_nlc, fpr_nlc = roc_analysis(all_linear_nlc, all_nonlinear_nlc, ttt_nlc)
+    tpr_score, fpr_score = roc_analysis(all_linear_score, all_nonlinear_score, ttt_score)
 
-    auc_crv = np.round(auc(fpr_crv, tpr_crv), 2)
-    auc_nlc = np.round(auc(fpr_nlc, tpr_nlc), 2)
-
-    # create logistic regression model combining curvature and NLC metric
-    all_nlc = np.hstack((all_linear_nlc, all_nonlinear_nlc))
-    nlc_mean = np.mean(all_nlc)
-    nlc_std = np.std(all_nlc)
-    all_nlc -= nlc_mean
-    all_nlc /= nlc_std
-    all_crv = np.hstack((all_linear_crv, all_nonlinear_crv))
-    crv_mean = np.mean(all_crv)
-    crv_std = np.std(all_crv)
-    all_crv -= crv_mean
-    all_crv /= crv_std
-    X = np.hstack((all_crv[:, None], all_nlc[:, None]))
-    ix = np.arange(X.shape[0])
-    np.random.shuffle(ix)
-    ix_train = ix[:ix.size//2]
-    ix_test = ix[ix.size//2:]
-    out_labels = np.hstack((np.zeros(all_linear_nlc.size, dtype=bool), np.ones(all_nonlinear_nlc.size, dtype=bool)))
-    test_true = out_labels[ix_test]
-    test_false = np.logical_not(out_labels[ix_test])
-    lrm = LogisticRegression()
-    lrm.fit(X[ix_train], out_labels[ix_train])
-    class_prob = lrm.predict_proba(X[ix_test])[:, 1]
-    ttt_lrm = np.linspace(0, 1, 1000)
-    tpr_lrm, fpr_lrm = roc_analysis(class_prob[test_false], class_prob[test_true], ttt_lrm)
-    auc_lrm = np.round(auc(fpr_lrm, tpr_lrm), 2)
-
-    print("Logistic regression model scalings and parameters:")
-    print(f"NLC Mean: {nlc_mean}")
-    print(f"NLC Standard Deviation: {nlc_std}")
-    print(f"Curvature Mean: {crv_mean}")
-    print(f"Curvature Standard Deviation: {crv_std}")
-    print(f"LRM Curvature weight: {lrm.coef_[0, 0]}")
-    print(f"LRM NLC weight: {lrm.coef_[0, 1]}")
-    print(f"LRM intercept: {lrm.intercept_}")
+    auc_crv = np.round(auc(fpr_score, tpr_score), 2)
 
     fig = pl.figure()
-    pl.plot(fpr_crv, tpr_crv, label=f"Curvature. AUC={auc_crv}")
-    pl.plot(fpr_nlc, tpr_nlc, label=f"NLC. AUC={auc_nlc}")
-    pl.plot(fpr_lrm, tpr_lrm, label=f"LRM. AUC={auc_lrm}")
+    pl.plot(fpr_score, tpr_score, label=f"Linear model score. AUC={auc_crv}")
     pl.plot([0, 1], [0, 1], 'k--')
     pl.xlabel("False positive rate")
     pl.ylabel("True positive rate")
-    pl.xlim(0, 1)
-    pl.ylim(0, 1)
+    pl.xlim(0, 1.05)
+    pl.ylim(0, 1.05)
     pl.legend()
     sns.despine()
     fig.savefig(path.join(plot_dir, "ROC_Analysis.pdf"))
 
-    # plot both the true-positive rate and false-positive rate for our classifier model by threshold
+    # plot both the true-positive rate and false-positive rate for using the linear model scrore by threshold
     fig = pl.figure()
-    pl.plot(ttt_lrm, tpr_lrm, label="True positive")
-    pl.plot(ttt_lrm, fpr_lrm, label="False positive")
-    pl.plot([0, 1], [0.01, 0.01], 'k--')
-    acceptable = np.where(fpr_lrm < 0.01)[0][0]
-    pl.plot([ttt_lrm[acceptable], ttt_lrm[acceptable]], [0, 1], 'k--')
-    pl.xlabel("Threshold p(nonlinear)")
+    pl.plot(ttt_score, 1-tpr_score, label="False negative")
+    pl.plot(ttt_score, fpr_score, label="False positive")
+    pl.plot([0, 1], [0.05, 0.05], 'k--')
+    pl.plot([0.8, 0.8], [0, 1], 'k--')
+    pl.xlabel("Linear model score threshold ($R^2$)")
     pl.ylabel("Rate")
-    pl.ylim(0, 1)
-    pl.yticks([0, 0.25, 0.5, 0.75, 1.0])
-    pl.xlim(0, 1)
-    pl.xticks([0, 0.25, 0.5, 0.75, 1.0])
+    pl.ylim(0, 1.05)
+    pl.yticks([0, 0.05, 0.25, 0.5, 0.75, 1.0])
+    pl.xlim(-0.05, 1.05)
+    pl.xticks([0, 0.25, 0.5, 0.8, 1.0])
     pl.legend()
     sns.despine()
-    fig.savefig(path.join(plot_dir, "NL_LRM_performance.pdf"))
+    fig.savefig(path.join(plot_dir, "LinearModelScore_performance.pdf"))
 
-    with h5py.File(path.join(plot_dir, "cnn_nonlin_test_data.hdf5"), 'w') as dfile:
-        dfile.create_dataset("nlc_mean", data=nlc_mean)
-        dfile.create_dataset("nlc_std", data=nlc_std)
-        dfile.create_dataset("crv_mean", data=crv_mean)
-        dfile.create_dataset("crv_std", data=crv_std)
-        dfile.create_dataset("lrm_coef", data=lrm.coef_)
-        dfile.create_dataset("lrm_intercept", data=lrm.intercept_)
+    # plot scatters relating 1st and 2nd order model scores
+    fig = pl.figure()
+    pl.plot([0, 1], [0, 1], 'k--')
+    pl.scatter(all_lscore, all_sqscore, s=4, alpha=0.5)
+    pl.xlabel("Linear model scores ($R^2$)")
+    pl.ylabel("2nd order model scores ($R^2$)")
+    sns.despine()
+    fig.savefig(path.join(plot_dir, "2ndorder_vs_linear_scores.pdf"))
+
+    # plot relationship of nonlinearity metrics and 1st order model score
+    lscore_test_bins = mquantiles(all_lscore, np.linspace(0, 1, 50))
+    lscore_test_bin_cents = lscore_test_bins[:-1] + np.diff(lscore_test_bins) / 2
+
+    boot_sample = utilities.bootstrap_binned_average(all_lscore, all_crv, lscore_test_bins, 5000)
+    average = np.nanmean(boot_sample, 0)
+    ci_low = np.nanpercentile(boot_sample, 2.5, 0)
+    ci_high = np.nanpercentile(boot_sample, 97.5, 0)
+    fig = pl.figure()
+    pl.plot(lscore_test_bin_cents, average, 'o')
+    pl.fill_between(lscore_test_bin_cents, ci_low, ci_high, alpha=0.4)
+    pl.xlabel("Linear model score")
+    pl.ylabel("Average Curvature")
+    sns.despine()
+    fig.savefig(path.join(plot_dir, f"Avg_Crv_by_lscore.pdf"))
+
+    boot_sample = utilities.bootstrap_binned_average(all_lscore, all_nlc, lscore_test_bins, 5000)
+    average = np.nanmean(boot_sample, 0)
+    ci_low = np.nanpercentile(boot_sample, 2.5, 0)
+    ci_high = np.nanpercentile(boot_sample, 97.5, 0)
+    fig = pl.figure()
+    pl.plot(lscore_test_bin_cents, average, 'o')
+    pl.fill_between(lscore_test_bin_cents, ci_low, ci_high, alpha=0.4)
+    pl.xlabel("Linear model score")
+    pl.ylabel("Average NLC")
+    sns.despine()
+    fig.savefig(path.join(plot_dir, f"Avg_NLC_by_lscore.pdf"))
+
+    with h5py.File(path.join(plot_dir, "cnn_complx_test_data.hdf5"), 'w') as dfile:
         dfile.create_dataset("all_filters", data=np.vstack(all_filters))
-        dfile.create_dataset("curve_diffed", data=curve_diffed)
-        dfile.create_dataset("curve_rect", data=curve_rect)
-        dfile.create_dataset("curve_tanhpow", data=curve_tanhpow)
-        dfile.create_dataset("curve_conved", data=curve_conved)
-        dfile.create_dataset("nlc_diffed", data=nlc_diffed)
-        dfile.create_dataset("nlc_rect", data=nlc_rect)
-        dfile.create_dataset("nlc_tanhpow", data=nlc_tanhpow)
-        dfile.create_dataset("nlc_conved", data=nlc_conved)
+        dfile.create_dataset("lscore_diffed", data=lscore_diffed)
+        dfile.create_dataset("lscore_rect", data=lscore_rect)
+        dfile.create_dataset("lscore_tanhpow", data=lscore_tanhpow)
+        dfile.create_dataset("lscore_conved", data=lscore_conved)
+        dfile.create_dataset("all_lscore", data=all_lscore)
+        dfile.create_dataset("all_sqscore", data=all_sqscore)
+        dfile.create_dataset("all_crv", data=all_crv)
+        dfile.create_dataset("all_nlc", data=all_nlc)

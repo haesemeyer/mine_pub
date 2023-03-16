@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 import model
 import h5py
-from typing import Union, List, Any, Optional
+from typing import Union, List, Any, Optional, Tuple
 from scipy import signal as sig
 from scipy.stats import entropy
 from sklearn.neighbors import KDTree
@@ -152,6 +152,34 @@ def create_overwrite(storage: Union[h5py.File, h5py.Group], name: str, data: Any
         storage.create_dataset(name, data=data, compression="gzip", compression_opts=5)
     else:
         storage.create_dataset(name, data=data)
+
+
+def modelweights_to_hdf5(storage: Union[h5py.File, h5py.Group], m_weights: List[np.ndarray]) -> None:
+    """
+    Stores tensorflow weights of a model sequentially to an hdf5 file or group to allow for more compact storage
+    across many models (NOTE: No states are saved)
+    :param storage: The hdf5 file or group used to store the information
+    :param m_weights: List of weight arrays returned by keras.model.get_weights()
+    """
+    storage.create_dataset("n_layers", data=len(m_weights))
+    for i, mw in enumerate(m_weights):
+        if type(mw) == np.ndarray:
+            storage.create_dataset(f"layer_{i}", data=mw, compression="gzip", compression_opts=5)
+        else:
+            storage.create_dataset(f"layer_{i}", data=mw)
+
+
+def modelweights_from_hdf5(storage: Union[h5py.File, h5py.Group]) -> List[np.ndarray]:
+    """
+    Loads tensorflow model weights from an hdf5 file or group
+    :param storage: The hdf5 file or group from which to load the information
+    :return: List of weight arrays that can be used with keras.model.set_weights() to set model weights
+    """
+    n_layers = storage["n_layers"][()]
+    m_weights = []
+    for i in range(n_layers):
+        m_weights.append(storage[f"layer_{i}"][()])
+    return m_weights
 
 
 def create_random_wave_predictor(time_base: np.ndarray) -> np.ndarray:
@@ -425,6 +453,63 @@ def modified_gram_schmidt(col_mat: np.ndarray) -> np.ndarray:
     norms[norms < 1e-9] = 1e-9
     v /= norms
     return v
+
+
+def generate_dvs_design_matrix(sig_out: np.ndarray, sig_in: np.ndarray,
+                               hist_frames: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generates a design matrix (and corresponding output vector) for estimating 1st and 2nd order
+    Volterra kernels using linear regression
+    :param sig_out: The output signal
+    :param sig_in: The input signal
+    :param hist_frames: The number of frames to consider as history including the current time (i.e. >=1)
+    :return:
+        [0]: The output [sig_out.size-hist_frames+1 x 1] values corresponding to rows in the input
+        [1]: The design matrix [sig_out.size-hist_frames+1 x 1+hist_frames+hist_frames+(hist_frames^2-hist_frames)/2]
+    """
+    if sig_in.size != sig_out.size:
+        raise ValueError(f"sig_in and sig_out need to have the same number of elements not {sig_in.size}, "
+                         f"{sig_out.size}")
+    y = sig_out[hist_frames-1:].copy()
+    x = np.full((y.size, 1+2*hist_frames+(hist_frames**2-hist_frames)//2), np.nan)
+    x[:, 0] = np.ones(y.size)  # the intercept
+    order_2_counter = 0
+    for i in range(hist_frames):
+        x[:, 1+i] = sig_in[hist_frames-1-i:][:x.shape[0]]  # first-order elements
+        for j in range(i, hist_frames):
+            x[:, 1+hist_frames+order_2_counter] = sig_in[hist_frames-1-i:][:x.shape[0]] * \
+                                                  sig_in[hist_frames-1-j:][:x.shape[0]]
+            order_2_counter += 1
+    return y, x
+
+
+def lrcoefs_to_vkernels(coefs: np.ndarray, hist_frames: int) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Splits a vector of coefficients obtained by linearly regressing the volterra design matrix against the outputs
+    into the 0th, 1st and 2nd order Volterra kernels
+    :param coefs: The coefficients obtained after linear regression
+    :param hist_frames: The number of history frames used (note: This shouldn't be necessary could be calculated)
+    :return:
+        [0]: k0 (scalar)
+        [1]: k1 (hist_frames sized vector)
+        [2]: k2 (hist_frames x hist_frames sized matrix)
+    """
+    exp_size = 1+2*hist_frames+(hist_frames**2-hist_frames)//2
+    if coefs.size != exp_size:
+        raise ValueError(f"coefs has the wrong size for given history. For history {hist_frames} should be {exp_size} "
+                         f"but is {coefs.size}")
+    c = coefs.ravel()
+    k0 = c[0]
+    k1 = c[1:hist_frames+1]
+    k2 = np.full((hist_frames, hist_frames), np.nan)
+    order_2_counter = 0
+    for i in range(hist_frames):
+        for j in range(i, hist_frames):
+            k2[i, j] = c[1+hist_frames+order_2_counter]
+            if i != j:
+                k2[j, i] = c[1+hist_frames+order_2_counter]
+            order_2_counter += 1
+    return k0, k1, k2
 
 
 class NonlinClassifier:

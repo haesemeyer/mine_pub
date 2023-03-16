@@ -6,8 +6,7 @@ import numpy as np
 from typing import List, Optional, Union
 import utilities
 import model
-from taylorDecomp import all_decomposition_metrics, d2ca_dr2, data_mean_prediction
-from perf_nlc_nonlin import calc_nlc
+from taylorDecomp import taylor_decompose, d2ca_dr2, complexity_scores
 from dataclasses import dataclass
 
 
@@ -20,9 +19,10 @@ class MineData:
     taylor_true_change: Optional[np.ndarray]
     taylor_full_prediction: Optional[np.ndarray]
     taylor_by_predictor: Optional[np.ndarray]
-    nl_probabilities: Optional[np.ndarray]
+    model_lin_approx_scores: Optional[np.ndarray]
     mean_exp_scores: Optional[np.ndarray]
     jacobians: Optional[np.ndarray]
+    hessians: Optional[np.ndarray]
 
     def save_to_hdf5(self, file_object: Union[h5py.File, h5py.Group], overwrite=False) -> None:
         """
@@ -37,12 +37,14 @@ class MineData:
             utilities.create_overwrite(file_object, "taylor_true_change", self.taylor_true_change, overwrite)
             utilities.create_overwrite(file_object, "taylor_full_prediction", self.taylor_full_prediction, overwrite)
             utilities.create_overwrite(file_object, "taylor_by_predictor", self.taylor_by_predictor, overwrite)
-        if self.nl_probabilities is not None:
-            utilities.create_overwrite(file_object, "nl_probs", self.nl_probabilities, overwrite)
+        if self.model_lin_approx_scores is not None:
+            utilities.create_overwrite(file_object, "model_lin_approx_scores", self.model_lin_approx_scores, overwrite)
         if self.mean_exp_scores is not None:
             utilities.create_overwrite(file_object, "me_scores", self.mean_exp_scores, overwrite)
         if self.jacobians is not None:
             utilities.create_overwrite(file_object, "jacobians", self.jacobians, overwrite)
+        if self.hessians is not None:
+            utilities.create_overwrite(file_object, "hessians", self.hessians, overwrite)
 
 
 class Mine:
@@ -51,14 +53,13 @@ class Mine:
     analysis function to be run on user-data
     """
     def __init__(self, train_fraction: float, model_history: int, corr_cut: float, compute_taylor: bool,
-                 compute_complexity: bool, return_jacobians: bool, taylor_look_ahead: int, taylor_pred_every: int):
+                 return_jacobians: bool, taylor_look_ahead: int, taylor_pred_every: int):
         """
         Create a new Mine object
         :param train_fraction: The fraction of frames to use for training 0 < train <= 1
         :param model_history: The number of frames to include in the model "history" (Note 1)
         :param corr_cut: Minimum correlation required on test data to compute other metrics
-        :param compute_taylor: If true, perform taylor expansion and nonlinearity evaluation and return results
-        :param compute_complexity: If true, compute mean-expansion scores and return results
+        :param compute_taylor: If true, perform taylor expansion and complexity/nonlin evaluation and return results
         :param return_jacobians: If true, return the model jacobians at the data mean
         :param taylor_look_ahead: How many frames into the future to compute the taylor expansion (usually a few secs)
         :param taylor_pred_every: Every how many frames to compute the taylor expansion to save time
@@ -73,8 +74,16 @@ class Mine:
             raise ValueError("model_history cant be < 0")
         self.model_history = model_history
         self.compute_taylor = compute_taylor
-        self.compute_complexity = compute_complexity
         self.return_jacobians = return_jacobians
+        # set following to true to return hessians -
+        # Note memory requirements of (n_sample x (n_timepointsxn_predictors)^2) sized array
+        self.return_hessians = False
+        # set the following to an hdf5 file our group object to store model-weights in subgroups labeled
+        # according to "cell_{cell_index}_weights". These model-weights can be loaded into a list compatible
+        # with tensorflow.keras.model.set_weights() using the utilities.modelweights_from_hdf5 function
+        # NOTE: Before setting the weights, the model has to be initialized to the appropriate model structure
+        # by evaluation on an appropriately structured test input
+        self.model_weight_store: Union[None, h5py.Group, h5py.File] = None
         self.n_epochs = 100  # sensible default
         self.taylor_look_ahead = taylor_look_ahead
         self.taylor_pred_every = taylor_pred_every
@@ -115,23 +124,24 @@ class Mine:
             taylor_true_change = []
             taylor_full_prediction = []
             taylor_by_pred = []
-            curvatures = correlations_test.copy()
-            nlcs = correlations_test.copy()
+            lin_approx_scores = correlations_test.copy()
+            me_scores = correlations_test.copy()
         else:
             taylor_scores = None
             taylor_true_change = None
             taylor_full_prediction = None
             taylor_by_pred = None
-            curvatures = None
-            nlcs = None
-        if self.compute_complexity:
-            me_scores = correlations_test.copy()
-        else:
+            lin_approx_scores = None
             me_scores = None
         if self.return_jacobians:
             all_jacobians = np.full((response_data.shape[0], self.model_history * n_predictors), np.nan)
         else:
             all_jacobians = None
+        if self.return_hessians:
+            all_hessians = np.full((response_data.shape[0], self.model_history * n_predictors,
+                                    self.model_history * n_predictors), np.nan)
+        else:
+            all_hessians = None
 
         data_obj = utilities.Data(self.model_history, pred_data, response_data, train_frames)
         # create model once
@@ -149,6 +159,9 @@ class Mine:
             m(np.random.randn(1, self.model_history, len(data_obj.regressors)).astype(np.float32))
             # train
             model.train_model(m, tset, self.n_epochs, data_obj.ca_responses.shape[1])
+            if self.model_weight_store is not None:
+                w_group = self.model_weight_store.create_group(f"cell_{cell_ix}_weights")
+                utilities.modelweights_to_hdf5(w_group, m.get_weights())
             # evaluate
             p, r = data_obj.predict_response(cell_ix, m)
             c_tr = np.corrcoef(p[:train_frames], r[:train_frames])[0, 1]
@@ -163,19 +176,25 @@ class Mine:
                     print(f"        Unit {cell_ix+1} out of {response_data.shape[0]} fit. "
                           f"Test corr={correlations_test[cell_ix]} which was below cut-off.")
                 continue
+            # compute first and second order derivatives
+            tset = data_obj.training_data(cell_ix, 256)
+            all_inputs = []
+            for inp, outp in tset:
+                all_inputs.append(inp.numpy())
+            x_bar = np.mean(np.vstack(all_inputs), 0, keepdims=True)
+            jacobian, hessian = d2ca_dr2(m, x_bar)
             # compute taylor-expansion and nonlinearity evaluation if requested
             if self.compute_taylor:
                 # compute taylor expansion
-                true_change, pc, by_pred, avg_curve, allc = all_decomposition_metrics(m, regressors,
-                                                                                      self.taylor_pred_every,
-                                                                                      self.taylor_look_ahead)
+                true_change, pc, by_pred = taylor_decompose(m, regressors, self.taylor_pred_every,
+                                                            self.taylor_look_ahead)
                 taylor_true_change.append(true_change)
                 taylor_full_prediction.append(pc)
                 taylor_by_pred.append(by_pred)
-                # compute NLC
-                nlc = calc_nlc(regressors, m)[0]
-                curvatures[cell_ix] = avg_curve
-                nlcs[cell_ix] = nlc
+                # compute first and 2nd order model predictions
+                lin_score, o2_score = complexity_scores(m, x_bar, jacobian, hessian, regressors, self.taylor_pred_every)
+                lin_approx_scores[cell_ix] = lin_score
+                me_scores[cell_ix] = o2_score
                 # compute our by-predictor taylor importance as the fractional loss of r2 when excluding the component
                 off_diag_index = 0
                 for row in range(n_predictors):
@@ -193,31 +212,23 @@ class Mine:
                             taylor_scores[cell_ix, n_predictors + off_diag_index, 0] = np.mean(bsample)
                             taylor_scores[cell_ix, n_predictors + off_diag_index, 1] = np.std(bsample)
                             off_diag_index += 1
-            if self.compute_complexity or self.return_jacobians:
+            if self.return_jacobians or self.return_hessians:
                 # compute average predictor
-                tset = data_obj.training_data(cell_ix, 256)
-                all_inputs = []
-                for inp, outp in tset:
-                    all_inputs.append(inp.numpy())
-                x_bar = np.mean(np.vstack(all_inputs), 0, keepdims=True)
-                jacobian, hessian = d2ca_dr2(m, x_bar)
-                if self.compute_complexity:
-                    model_prediction, d_mean_prediction = data_mean_prediction(m, x_bar, jacobian, hessian, regressors,
-                                                                               self.taylor_pred_every)
-                    mean_pred_corr = np.corrcoef(model_prediction, d_mean_prediction)[0, 1]
-                    me_scores[cell_ix] = mean_pred_corr**2
                 if self.return_jacobians:
                     jacobian = jacobian.numpy().ravel()
                     # reorder jacobian by n_predictor long chunks of hist_steps timeslices
                     jacobian = np.reshape(jacobian, (self.model_history, n_predictors)).T.ravel()
                     all_jacobians[cell_ix, :] = jacobian
+                if self.return_hessians:
+                    hessian = np.reshape(hessian.numpy(), (x_bar.shape[2] * self.model_history,
+                                                           x_bar.shape[2] * self.model_history))
+                    hessian = utilities.rearrange_hessian(hessian, n_predictors, self.model_history)
+                    all_hessians[cell_ix, :, :] = hessian
             if self.verbose:
                 print(f"        Unit {cell_ix+1} out of {response_data.shape[0]} completed. "
                       f"Test corr={correlations_test[cell_ix]}")
         # convert nonlinearity metrics into probability if requested
         if self.compute_taylor:
-            nonlin_lrm = utilities.NonlinClassifier.get_standard_model()
-            nl_probs = nonlin_lrm.nonlin_probability(curvatures, nlcs)
             # turn the taylor predictions into ndarrays unless no unit passed threshold
             if len(taylor_true_change) > 0:
                 if data_obj.ca_responses.shape[0] > 1:
@@ -233,8 +244,7 @@ class Mine:
                 taylor_true_change = np.nan
                 taylor_full_prediction = np.nan
                 taylor_by_pred = np.nan
-        else:
-            nl_probs = None
         return_data = MineData(correlations_trained, correlations_test, taylor_scores, taylor_true_change,
-                               taylor_full_prediction, taylor_by_pred, nl_probs, me_scores, all_jacobians)
+                               taylor_full_prediction, taylor_by_pred, lin_approx_scores, me_scores, all_jacobians,
+                               all_hessians)
         return return_data

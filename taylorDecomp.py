@@ -494,8 +494,8 @@ def all_decomposition_metrics(mdl: model.ActivityPredictor, regressors: np.ndarr
         np.hstack(all_curvatures)
 
 
-def data_mean_prediction(mdl: model.ActivityPredictor, x_bar, j_x_bar, h_x_bar, regressors: np.ndarray,
-                         take_every: int) -> Tuple[np.ndarray, np.ndarray]:
+def data_mean_prediction(mdl: model.ActivityPredictor, x_bar, j_x_bar, h_x_bar, regressors: np.ndarray, take_every: int,
+                         return_1storder=False):
     """
     Computes the prediction of responses based on a fixed Taylor expansion of the network around a specific point
     in our case taken to be the data mean
@@ -505,13 +505,18 @@ def data_mean_prediction(mdl: model.ActivityPredictor, x_bar, j_x_bar, h_x_bar, 
     :param h_x_bar: The hession of the model at x_bar
     :param regressors: The 2D regressor matrix, n_timesteps x m_regressors
     :param take_every: Only compute metrics every n frames to save time
+    :param return_1storder: If set to true first order model predictions will be returned as well
     :return:
         [0]: The prediction of the CNN model
         [1]: The prediction of the fixed-point expansion
+        [2]: If return_1storder is set to true the prediction of a linear fixed-point expansion
     """
+    # NOTE: We should speed this up - create 2nd-order design matrix from input and then directly treat this as a
+    # regression problem, replacing the ugly while-loop with a matrix multiplication
     f_x_bar = mdl(x_bar)
     mean_prediction: List[float] = []
-    mdl_out_change: List[float] = []
+    mean_prediction_lin: List[float] = []
+    mdl_out: List[float] = []
     inp_length = mdl.input_length
     t: int = inp_length - 1
     # prepare our first and second derivatives at the data mean
@@ -523,12 +528,37 @@ def data_mean_prediction(mdl: model.ActivityPredictor, x_bar, j_x_bar, h_x_bar, 
         reg_diff = (cur_regs - x_bar).ravel().astype(np.float64)
         # get the actual model prediction at the current point and add to our return
         cur_mod_out = mdl.get_output(cur_regs)
-        mdl_out_change.append(cur_mod_out)
+        mdl_out.append(cur_mod_out)
         # compute taylor decomposition around data mean
-        mp = f_x_bar + np.dot(reg_diff, d1) + 0.5 * np.sum(np.dot(reg_diff[:, None], reg_diff[None, :]) * d2)
+        mp_lin = f_x_bar + np.dot(reg_diff, d1)
+        mp = mp_lin + 0.5 * np.sum(np.dot(reg_diff[:, None], reg_diff[None, :]) * d2)
         mean_prediction.append(mp)
+        if return_1storder:
+            mean_prediction_lin.append(mp_lin)
         t += take_every
-    return np.hstack(mdl_out_change), np.hstack(mean_prediction)
+    if return_1storder:
+        return np.hstack(mdl_out), np.hstack(mean_prediction), np.hstack(mean_prediction_lin)
+    return np.hstack(mdl_out), np.hstack(mean_prediction)
+
+
+def complexity_scores(mdl: model.ActivityPredictor, x_bar, j_x_bar, h_x_bar, regressors: np.ndarray, take_every: int):
+    """
+    Computes complexity scores - the squared correlation of a linear and a squared model around the data mean
+    :param mdl: The CNN model
+    :param x_bar: The data mean (or any arbitrary fix point)
+    :param j_x_bar: The jacobian of the model at x_bar
+    :param h_x_bar: The hession of the model at x_bar
+    :param regressors: The 2D regressor matrix, n_timesteps x m_regressors
+    :param take_every: Only compute metrics every n frames to save time
+    :return:
+        [0]: The R2 (coefficient of determination) of the linear 1st order approximation
+        [1]: The R2 of the 2nd order approximation
+    """
+    true_model, order_2, order_1 = data_mean_prediction(mdl, x_bar, j_x_bar, h_x_bar, regressors, take_every, True)
+    ss_tot = np.sum((true_model - np.mean(true_model))**2)
+    lin_score = 1 - np.sum((true_model - order_1)**2)/ss_tot
+    sq_score = 1 - np.sum((true_model - order_2)**2)/ss_tot
+    return lin_score, sq_score
 
 
 if __name__ == "__main__":
