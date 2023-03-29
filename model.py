@@ -203,8 +203,16 @@ class ActivityPredictor(keras.Model):
 
 
 def train_model(mdl: ActivityPredictor, tset: tf.data.Dataset, n_epochs: int, datacount: int) -> None:
+    """
+    Trains the model over n epochs. NOTE: The dataset passed should be generated from a shuffle with
+    reshuffle_each_iteration set to true to ensure that data is presented in shuffled order in each
+    training epoch
+    :param mdl: The model to train
+    :param tset: The dataset with training data
+    :param n_epochs: The number of epochs to train for
+    :param datacount: Unused
+    """
     for e in range(n_epochs):
-        tset.shuffle(datacount)
         for inp, outp in tset:
             mdl.train_step(inp, outp)
 

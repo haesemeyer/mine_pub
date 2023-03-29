@@ -705,7 +705,7 @@ class Data:
             for t in range(self.input_steps-1, out_data.size+self.input_steps-1):
                 in_data[t-self.input_steps+1, :, i] = this_reg[0, t-self.input_steps+1:t+1]
         train_ds = tf.data.Dataset.from_tensor_slices((in_data, out_data)).\
-            shuffle(in_data.shape[0]).batch(batch_size, drop_remainder=True)
+            shuffle(in_data.shape[0], reshuffle_each_iteration=True).batch(batch_size, drop_remainder=True)
         return train_ds.prefetch(tf.data.AUTOTUNE)
 
     def test_data(self, sample_ix: int, batch_size=32):
