@@ -1,6 +1,11 @@
-# Model-free identification of neural encoding (MINE)
+# Model identification of neural encoding (MINE)
 
 Repository for the code used in developing, testing and using MINE.
+The paper "Model discovery to link neural activity to behavioral tasks" which publishes this code can be found at:
+
+[Costabile JD, Balakrishnan KA, Schwinn S, Haesemeyer M (2023) eLife 12:e83289](https://doi.org/10.7554/eLife.83289
+)
+
 
 
 ## Main code modules
